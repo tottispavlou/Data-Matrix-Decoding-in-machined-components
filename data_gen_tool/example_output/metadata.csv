@@ -1,0 +1,7 @@
+image_id,rect_path,scene_path,grid_size,polarity
+synth_00000,images/rect/synth_00000.png,images/scene/synth_00000.jpg,16,dark_on_light
+synth_00001,images/rect/synth_00001.png,images/scene/synth_00001.jpg,16,dark_on_light
+synth_00002,images/rect/synth_00002.png,images/scene/synth_00002.jpg,14,light_on_dark
+synth_00003,images/rect/synth_00003.png,images/scene/synth_00003.jpg,16,light_on_dark
+synth_00004,images/rect/synth_00004.png,images/scene/synth_00004.jpg,14,light_on_dark
+synth_00005,images/rect/synth_00005.png,images/scene/synth_00005.jpg,14,dark_on_light

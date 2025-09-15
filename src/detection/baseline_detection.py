@@ -108,7 +108,7 @@ class DataMatrixDetector:
 
 def main():
     detector = DataMatrixDetector()
-    image_path = "data/raw/#D3FDPE01YB9NW0047XG505##XF36NATM.jpeg"
+    image_path = "data/raw/2J0L17962260003.jpeg"
     decoded_strings, annotated_image = detector.detect_and_decode(image_path)
 
     if decoded_strings:

@@ -1,3 +1,5 @@
 venv\Scripts\activate.bat
 
 python src/decoding/baseline_decoder.py
+
+pip freeze > requirements.txt
