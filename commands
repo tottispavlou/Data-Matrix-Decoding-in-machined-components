@@ -3,3 +3,7 @@ venv\Scripts\activate.bat
 python src/decoding/baseline_decoder.py
 
 pip freeze > requirements.txt
+
+python data_gen_tool/scripts/gen_synth.py --out_dir data_gen_tool/example_output_patched --n 50 --cell_px 24  --dot_dir data_gen_tool/data/patches/dot  --tex_dir data_gen_tool/data/textures/metal 
+
+    --space_dir data/patches/space \        # optional
