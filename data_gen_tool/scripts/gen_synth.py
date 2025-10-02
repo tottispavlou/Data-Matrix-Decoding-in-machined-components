@@ -24,28 +24,63 @@ import cv2
 
 # ---------------------- helpers ----------------------
 
-def make_faux_datamatrix(size: int) -> np.ndarray:
+def normalize_pts(pts, W, H):
+    # pts: (4,2) float32 in px -> normalized [0,1]
+    out = pts.copy().astype(np.float32)
+    out[:, 0] /= float(W)
+    out[:, 1] /= float(H)
+    return out
+
+def order_quad_clockwise(pts):
+    # pts: (4,2). Return TL, TR, BR, BL (clockwise)
+    # sort by y, then split top/bottom
+    pts = np.array(pts, dtype=np.float32)   
+    ys = pts[:,1]
+    top_idx = np.argsort(ys)[:2]
+    bot_idx = np.argsort(ys)[-2:]
+    top = pts[top_idx]; bot = pts[bot_idx]
+    # left/right by x within each row
+    tl, tr = top[np.argsort(top[:,0])]
+    bl, br = bot[np.argsort(bot[:,0])]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+def write_obb_txt(path, cls_id, quad_norm):
+    # quad_norm: (4,2) normalized, in order TL,TR,BR,BL
+    x1,y1 = quad_norm[0]; x2,y2 = quad_norm[1]; x3,y3 = quad_norm[2]; x4,y4 = quad_norm[3]
+    with open(path, "w") as f:
+        f.write(f"{cls_id} {x1:.6f} {y1:.6f} {x2:.6f} {y2:.6f} {x3:.6f} {y3:.6f} {x4:.6f} {y4:.6f}\n")
+
+def make_faux_datamatrix(size: int, payload_p: float = 0.5) -> np.ndarray:
+    """
+    Build a simple DataMatrix-like grid with proper borders:
+      - Finder L: left column + bottom row are solid 1s
+      - Clocking: top row + right column alternate 1/0
+    Interior modules are random Bernoulli(payload_p).
+    Works for any even size >= 10 (e.g., 14, 16).
+    """
+    assert size % 2 == 0 and size >= 10, "size should be an even number (e.g., 14 or 16)"
+
     M = np.zeros((size, size), dtype=np.uint8)
 
-    # Finder L
-    M[:, 0] = 1
-    M[-1, :] = 1
+    # Finder L (solid)
+    M[:, 0] = 1           # left
+    M[-1, :] = 1          # bottom
 
-    # Timing
+    # Clocking (alternating)
     for j in range(size):
-        M[0, j] = 1 if j % 2 == 0 else 0
+        M[0, j] = j % 2   # top
     for i in range(size):
-        M[i, -1] = 1 if i % 2 == 0 else 0
+        M[i, -1] = i % 2  # right
 
-    M[0, 0] = 1          # top-left
-    M[-1, 0] = 1         # bottom-left
-    M[-1, -1] = 1        # bottom-right
+    # Ensure the three L corners are solid 1 (avoid top/right overwrite)
+    M[0, 0]   = 1         # top-left
+    M[-1, 0]  = 1         # bottom-left
+    M[-1, -1] = 1         # bottom-right
 
-    for i in range(1, size-1):
-        for j in range(1, size-1):
-            if i in (0, size-1) or j in (0, size-1):
-                continue
-            M[i, j] = random.randint(0, 1)
+    # Interior payload (exclude the 1-cell border all around)
+    if size > 2:
+        interior = (np.random.rand(size - 2, size - 2) < float(payload_p)).astype(np.uint8)
+        M[1:-1, 1:-1] = interior
 
     return M
 
@@ -232,8 +267,12 @@ def main():
     ap.add_argument("--perspective_prob", type=float, default=0.6)
     ap.add_argument("--jpeg_q", type=int, default=95)
     ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
+    ap.add_argument("--grid_sizes", type=int, nargs="+", default=[14, 16],
+                    help="Allowed DataMatrix sizes (modules per side).")
+    ap.add_argument("--scale_min", type=float, default=0.4)
+    ap.add_argument("--scale_max", type=float, default=1.0)
 
+    args = ap.parse_args()
     random.seed(args.seed); np.random.seed(args.seed)
 
     out = Path(args.out_dir)
@@ -251,44 +290,67 @@ def main():
 
     index_rows = []
     for i in range(args.n):
-        size = random.choice([14, 16])
+        size = random.choice(args.grid_sizes)
         M = make_faux_datamatrix(size)
 
-        # rectified crop assembled from your patches
+        # build rectified crop
         rect_img, _, _ = render_rectified_with_patches(M, args.cell_px, dot_lib, space_lib, tex_paths)
 
-        # compose full scene
-        h, w = rect_img.shape
-        H, W = int(h*2.0), int(w*2.0)  # scene scale 2x
+        # random scale
+        scale = np.random.uniform(args.scale_min, args.scale_max)
+        h, w = rect_img.shape[:2]
+        new_w, new_h = int(w * scale), int(h * scale)
+        rect_img = cv2.resize(rect_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # build scene (2x rect size for margin)
+        H, W = int(new_h * 2.0), int(new_w * 2.0)
         bg = compose_background(H, W, tex_paths, args.use_real_tex_prob, args.tex_blend,
                                 orient_blur=True, ksize=31, deg_range=(-20,20))
-        # paste center with mild blend
         scene = bg.copy()
-        y0 = (H - h)//2; x0 = (W - w)//2
-        scene[y0:y0+h, x0:x0+w] = cv2.addWeighted(scene[y0:y0+h, x0:x0+w], 0.3, rect_img, 0.7, 0)
 
-        # glare + scratches + noise
+        # random placement
+        H, W = scene.shape[:2]
+        x0 = np.random.randint(0, W - new_w)
+        y0 = np.random.randint(0, H - new_h)
+
+        scene[y0:y0+new_h, x0:x0+new_w] = cv2.addWeighted(
+            scene[y0:y0+new_h, x0:x0+new_w], 0.1, rect_img, 0.9, 0
+        )
+
+        # define quad from scaled size
+        quad = np.array([
+            [x0,        y0],
+            [x0+new_w,  y0],
+            [x0+new_w,  y0+new_h],
+            [x0,        y0+new_h]
+        ], dtype=np.float32)
+
+        # add effects
         scene = add_glare_multi(scene)
         scene = add_scratches(scene)
         noise = np.random.normal(0, 3.0, size=scene.shape).astype(np.float32)
         scene = np.clip(scene.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
-        # optional perspective
+        # optional perspective warp
+        Hmat = None
         if random.random() < args.perspective_prob:
-            scene, _ = warp_perspective(scene, strength=np.random.uniform(0.05, 0.18))
+            scene, Hmat = warp_perspective(scene, strength=np.random.uniform(0.05, 0.18))
 
-        # save
+        quad_warped = quad.copy()
+        if Hmat is not None:
+            quad_warped = cv2.perspectiveTransform(quad.reshape(1, -1, 2), Hmat).reshape(-1, 2)
+
+        # save rect + scene
         rect_path  = out/"images"/"rect"/f"synth_{i:05d}.png"
         scene_path = out/"images"/"scene"/f"synth_{i:05d}.jpg"
         cv2.imwrite(str(rect_path), rect_img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
         cv2.imwrite(str(scene_path), scene, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_q])
 
-        # labels
-        cx, cy, ww, hh = yolo_box_centered(scene, pad=0)
-        with open(out/"labels"/"yolo"/f"synth_{i:05d}.txt", "w") as f:
-            f.write(f"0 {cx:.6f} {cy:.6f} {ww:.6f} {hh:.6f}\n")
-        with open(out/"labels"/"grid"/f"synth_{i:05d}.json", "w") as f:
-            json.dump({"grid_size_known": size, "bit_matrix": M.tolist(), "decode_gt": None}, f)
+        # labels (OBB)
+        quad_ord = order_quad_clockwise(quad_warped)
+        quad_norm = normalize_pts(quad_ord, W, H)
+        obb_path = out/"labels"/"yolo"/f"synth_{i:05d}.txt"
+        write_obb_txt(obb_path, 0, quad_norm)
 
         index_rows.append({
             "image_id": f"synth_{i:05d}",
@@ -299,9 +361,11 @@ def main():
 
     with open(out/"metadata.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["image_id","rect_path","scene_path","grid_size"])
-        writer.writeheader(); writer.writerows(index_rows)
+        writer.writeheader()
+        writer.writerows(index_rows)
 
     print(f"[OK] Generated {len(index_rows)} samples in {out}")
 
 if __name__ == "__main__":
     main()
+

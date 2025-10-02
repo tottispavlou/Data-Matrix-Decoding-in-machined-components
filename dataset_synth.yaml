@@ -1,0 +1,7 @@
+# dataset_synth.yaml
+train: C:/Users/User/Documents/GitHub/Data-Matrix-Decoding-in-machined-components/data/synthetic/images/
+val:   C:/Users/User/Documents/GitHub/Data-Matrix-Decoding-in-machined-components/data/raw/val/images/
+test:  C:/Users/User/Documents/GitHub/Data-Matrix-Decoding-in-machined-components/data/raw/test/images/
+
+names:
+  0: datamatrix
