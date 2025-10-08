@@ -3,5 +3,4 @@ data_gen_tool/example_output
 data_gen_tool/example_output_patched
 data
 runs
-yolo11n-obb.pt
 yolo11n.pt

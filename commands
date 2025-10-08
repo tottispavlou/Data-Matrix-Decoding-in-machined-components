@@ -2,6 +2,8 @@ venv\Scripts\activate.bat
 
 python src/decoding/baseline_decoder.py
 
+python data/data_spliter.py
+
 pip freeze > requirements.txt
 
 # data generation tool
@@ -10,6 +12,8 @@ python data_gen_tool/scripts/gen_synth.py --out_dir data_gen_tool/example_output
     --space_dir data/patches/space \        # optional
 
 # gaussian preprocessing
+python src/preproc/preprocess_gaussian.py --in_dir data/raw/all --out_dir data/preproc/divide --method divide --debug
+
 python src/preproc/preprocess_gaussian.py --in_dir data/raw/test/images --out_dir data/preproc/adaptive --method adaptive --debug
 
 python src/preproc/preprocess_gaussian.py --in_dir data/raw/test/images --out_dir data/preproc/divide --method divide --ksize 51 --sigma 0 --debug

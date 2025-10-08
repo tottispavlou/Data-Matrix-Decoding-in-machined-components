@@ -1,7 +1,11 @@
-# dataset_real.yaml
-train: C:/Users/User/Documents/GitHub/Data-Matrix-Decoding-in-machined-components/data/raw/train/images/
-val:   C:/Users/User/Documents/GitHub/Data-Matrix-Decoding-in-machined-components/data/raw/val/images/
-test:  C:/Users/User/Documents/GitHub/Data-Matrix-Decoding-in-machined-components/data/raw/test/images/
+train:
+  - data/raw/train/images/
+val:
+  - data/raw/val/images/
+test:
+  - data/raw/test/images/
 
+nc: 2
 names:
-  0: datamatrix
+  0: dot_peened
+  1: laser
