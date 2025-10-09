@@ -22,7 +22,7 @@ def gaussian_bg_correct(bgr, method="adaptive", ksize=51, sigma=0.0):
     chosen = method
     if method == "adaptive":
         mean_intensity = gray.mean()
-        if mean_intensity > 130:   # quite bright → glare
+        if mean_intensity > 120:   # quite bright → glare
             chosen = "divide"
         else:                      # darker → preserve dots
             chosen = "subtract"

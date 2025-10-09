@@ -7,19 +7,23 @@ python data/data_spliter.py
 pip freeze > requirements.txt
 
 # data generation tool
-python data_gen_tool/scripts/gen_synth.py --out_dir data_gen_tool/example_output_patched --n 50 --cell_px 24  --dot_dir data_gen_tool/data/patches/dot  --tex_dir data_gen_tool/data/textures/metal 
+python data_gen_tool/scripts/gen_synth.py --dot_dir data_gen_tool/data/patches/dot  --tex_dir data_gen_tool/data/textures/metal --out_dir data/synthetic --n 10
 
-    --space_dir data/patches/space \        # optional
+  #optional # --space_dir data/patches/space
+
+# gen data validation
+python data_gen_tool/scripts/gen_data_val.py --img_dir data/synthetic/images/scene --label_dir data/synthetic/labels/yolo --out_dir data_gen_tool/validate
 
 # gaussian preprocessing
-python src/preproc/preprocess_gaussian.py --in_dir data/raw/all --out_dir data/preproc/divide --method divide --debug
+python src/preproc/preprocess_gaussian.py --in_dir data/synthetic/images/scene --out_dir data/preproc/synth --method divide --debug
 
-python src/preproc/preprocess_gaussian.py --in_dir data/raw/test/images --out_dir data/preproc/adaptive --method adaptive --debug
+python src/preproc/preprocess_gaussian.py --in_dir data/raw/all/images --out_dir data/preproc/real --method divide --debug
 
-python src/preproc/preprocess_gaussian.py --in_dir data/raw/test/images --out_dir data/preproc/divide --method divide --ksize 51 --sigma 0 --debug
+    # methods --method adaptive, --method divide, --method subtract 
 
-python src/preproc/preprocess_gaussian.py --in_dir data/raw/test/images --out_dir data/preproc/subtract --method subtract --ksize 51 --sigma 0 --debug
-
+# spliter
+cd data
+python data_spliter.py
 
 # training commands
 # real-only
@@ -32,7 +36,6 @@ yolo obb train data=dataset_mix.yaml   model=yolo11n-obb.pt  epochs=100 imgsz=64
 # prediction commands
 # real-only
 yolo obb predict model=runs/obb/real_only_y11_obb/weights/best.pt source=data/preproc/adaptive save_txt=True save_conf=True
-
 
 # rectification
 python src/detection/rectify_crops.py --img_dir data/raw/test/images --label_dir runs/obb/predict2/labels --out_dir data/rectified_crops2 --pad 0.1 --size 256 --debug

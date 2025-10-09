@@ -1,6 +1,7 @@
 venv
 data_gen_tool/example_output
-data_gen_tool/example_output_patched
 data
-runs
 yolo11n.pt
+data_gen_tool/validate
+yolo11n-obb.pt
+

@@ -52,37 +52,32 @@ def write_obb_txt(path, cls_id, quad_norm):
 
 def make_faux_datamatrix(size: int, payload_p: float = 0.5) -> np.ndarray:
     """
-    Build a simple DataMatrix-like grid with proper borders:
+    Build a proper DataMatrix-like grid:
       - Finder L: left column + bottom row are solid 1s
-      - Clocking: top row + right column alternate 1/0
-    Interior modules are random Bernoulli(payload_p).
-    Works for any even size >= 10 (e.g., 14, 16).
+      - Clocking: top row alternates 1,0,...; right column alternates 0,1,...
     """
-    assert size % 2 == 0 and size >= 10, "size should be an even number (e.g., 14 or 16)"
-
+    assert size % 2 == 0 and size >= 10, "size should be even (e.g., 14 or 16)"
     M = np.zeros((size, size), dtype=np.uint8)
 
-    # Finder L (solid)
-    M[:, 0] = 1           # left
-    M[-1, :] = 1          # bottom
+    # Finder L
+    M[:, 0] = 1
+    M[-1, :] = 1
 
-    # Clocking (alternating)
+    # Clocking pattern
     for j in range(size):
-        M[0, j] = j % 2   # top
+        M[0, j] = 1 if (j % 2 == 0) else 0       # top: 1,0,1,0,...
     for i in range(size):
-        M[i, -1] = i % 2  # right
+        M[i, -1] = 1 if (i % 2 == 1) else 0      # right: 0,1,0,1,...
 
-    # Ensure the three L corners are solid 1 (avoid top/right overwrite)
-    M[0, 0]   = 1         # top-left
-    M[-1, 0]  = 1         # bottom-left
-    M[-1, -1] = 1         # bottom-right
+    # Ensure corners are correct
+    M[0, 0] = 1
+    M[-1, 0] = 1
+    M[-1, -1] = 1
 
-    # Interior payload (exclude the 1-cell border all around)
-    if size > 2:
-        interior = (np.random.rand(size - 2, size - 2) < float(payload_p)).astype(np.uint8)
-        M[1:-1, 1:-1] = interior
-
+    # Payload
+    M[1:-1, 1:-1] = (np.random.rand(size-2, size-2) < payload_p).astype(np.uint8)
     return M
+
 
 def load_imgs(folder: Path):
     if folder is None or not folder.exists(): return []
@@ -169,7 +164,7 @@ def compose_background(H, W, tex_paths=None, use_real_prob=0.7, blend=0.5, orien
         return (bg*255).astype(np.uint8)
     return proc
 
-def add_glare_multi(img, layers=(1,2), strength=(0.15,0.45), width=(8.0,28.0), base_angle=None, angle_jitter=30):
+def add_glare_multi(img, layers=(1,2), strength=(0.15,0.30), width=(8.0,30.0), base_angle=None, angle_jitter=30):
     h, w = img.shape
     out = img.astype(np.float32)/255.0
     if base_angle is None:
@@ -197,7 +192,7 @@ def add_scratches(img, count=(20,80), length=(15,60), thickness=(1,2)):
         cv2.line(out, (x0,y0), (x1,y1), int(np.random.randint(180,255)), np.random.randint(thickness[0], thickness[1]+1))
     return out
 
-def warp_perspective(img, strength=0.12):
+def warp_perspective(img, strength):
     h, w = img.shape[:2]
     src = np.float32([[0,0],[w-1,0],[w-1,h-1],[0,h-1]])
     jitter = strength * min(h,w)
@@ -268,7 +263,7 @@ def main():
     ap.add_argument("--jpeg_q", type=int, default=95)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--grid_sizes", type=int, nargs="+", default=[14, 16],
-                    help="Allowed DataMatrix sizes (modules per side).")
+                    help="Allowed DataMatrix sizes")
     ap.add_argument("--scale_min", type=float, default=0.4)
     ap.add_argument("--scale_max", type=float, default=1.0)
 
@@ -310,8 +305,16 @@ def main():
 
         # random placement
         H, W = scene.shape[:2]
-        x0 = np.random.randint(0, W - new_w)
-        y0 = np.random.randint(0, H - new_h)
+
+
+        # Safe margin (e.g. 10% of background size)
+        margin_x = int(0.1 * W)
+        margin_y = int(0.1 * H)
+
+        # Random placement inside safe area
+        x0 = np.random.randint(margin_x, W - new_w - margin_x)
+        y0 = np.random.randint(margin_y, H - new_h - margin_y)
+
 
         scene[y0:y0+new_h, x0:x0+new_w] = cv2.addWeighted(
             scene[y0:y0+new_h, x0:x0+new_w], 0.1, rect_img, 0.9, 0
@@ -334,7 +337,7 @@ def main():
         # optional perspective warp
         Hmat = None
         if random.random() < args.perspective_prob:
-            scene, Hmat = warp_perspective(scene, strength=np.random.uniform(0.05, 0.18))
+            scene, Hmat = warp_perspective(scene, strength=np.random.uniform(0.05, 0.25))
 
         quad_warped = quad.copy()
         if Hmat is not None:
