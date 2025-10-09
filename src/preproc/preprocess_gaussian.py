@@ -27,10 +27,17 @@ def gaussian_bg_correct(bgr, method="adaptive", ksize=51, sigma=0.0):
         else:                      # darker → preserve dots
             chosen = "subtract"
 
+    # if chosen == "divide":
+    #     eps = 1e-6
+    #     corr = gray_f / (blur_f + eps)
+    #     corr -= corr.min()
+    #     if corr.max() > 0:
+    #         corr *= 255.0 / corr.max()
     if chosen == "divide":
         eps = 1e-6
-        corr = gray_f / (blur_f + eps)
-        corr -= corr.min()
+        ratio = gray_f / (blur_f + eps)
+        ratio = np.power(np.clip(ratio, 0, 5), 0.6)
+        corr = ratio - ratio.min()
         if corr.max() > 0:
             corr *= 255.0 / corr.max()
     elif chosen == "subtract":

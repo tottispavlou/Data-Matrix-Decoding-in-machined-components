@@ -17,7 +17,7 @@ python data_gen_tool/scripts/gen_data_val.py --img_dir data/synthetic/images/sce
 # gaussian preprocessing
 python src/preproc/preprocess_gaussian.py --in_dir data/synthetic/images/scene --out_dir data/preproc/synth --method divide --debug
 
-python src/preproc/preprocess_gaussian.py --in_dir data/raw/all/images --out_dir data/preproc/real --method divide --debug
+python src/preproc/preprocess_gaussian.py --in_dir data/raw/all/retry_pre --out_dir data/preproc/retry_pre --method divide --debug
 
     # methods --method adaptive, --method divide, --method subtract 
 
@@ -25,17 +25,25 @@ python src/preproc/preprocess_gaussian.py --in_dir data/raw/all/images --out_dir
 cd data
 python data_spliter.py
 
-# training commands
-# real-only
+# yolo training commands
+    # real-only
 yolo obb train data=dataset_real.yaml  model=yolo11n-obb.pt  epochs=100 imgsz=640 name=real_only_y11_obb
-# synth-only
+    # synth-only
 yolo obb train data=dataset_synth.yaml model=yolo11n-obb.pt  epochs=100 imgsz=640 name=synth_only_y11_obb
-# mixed
+    # mixed
 yolo obb train data=dataset_mix.yaml   model=yolo11n-obb.pt  epochs=100 imgsz=640 name=mix_y11_obb
 
-# prediction commands
-# real-only
-yolo obb predict model=runs/obb/real_only_y11_obb/weights/best.pt source=data/preproc/adaptive save_txt=True save_conf=True
+# yolo prediction commands
+    # real-only
+yolo obb predict model=runs/obb/real_only_y11_obb/weights/best.pt source=data/raw/test/images save_txt=True save_conf=True
+
+    # mix
+yolo obb predict model=runs/obb/mix_y11_obb/weights/best.pt source=data/raw/test/images save_txt=True save_conf=True
+
+# yolo validation commands
+yolo obb val model=runs/obb/real_only_y11_obb/weights/best.pt data=dataset_real.yaml split=test imgsz=640 save=True save_txt=True save_conf=True
+
+yolo obb val model=runs/obb/mix_y11_obb/weights/best.pt data=dataset_real.yaml split=test imgsz=640 save=True save_txt=True save_conf=True
 
 # rectification
-python src/detection/rectify_crops.py --img_dir data/raw/test/images --label_dir runs/obb/predict2/labels --out_dir data/rectified_crops2 --pad 0.1 --size 256 --debug
+python src/detection/rectify_crops.py --img_dir data/raw/test/images --label_dir runs/obb/predict/labels --out_dir data/rectified_crops --pad 0.1 --size 256 --debug
