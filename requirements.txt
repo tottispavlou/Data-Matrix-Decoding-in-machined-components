@@ -29,6 +29,6 @@ sympy==1.14.0
 torch==2.8.0
 torchvision==0.23.0
 typing_extensions==4.15.0
-ultralytics==8.3.203
+ultralytics==8.3.204
 ultralytics-thop==2.0.17
 urllib3==2.5.0
