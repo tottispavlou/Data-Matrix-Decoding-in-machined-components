@@ -30,6 +30,25 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+def normalize_dark_on_light(img_gray: np.ndarray) -> np.ndarray:
+    """
+    Return an image where code modules are DARK and background is LIGHT.
+    Uses Otsu on a lightly blurred image; inverts if the 'foreground' is bright.
+    """
+    g = cv2.GaussianBlur(img_gray, (3,3), 0)
+    _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # If the foreground (0s) is smaller than background, bw==0 are the modules.
+    # We want modules to be dark: bw==0 should correspond to 'dots/blocks'.
+    # If Otsu made modules white, invert.
+    # Heuristic: compare mean intensity inside dark vs light regions.
+    m_dark  = float(g[bw == 0].mean()) if np.any(bw == 0) else 0.0
+    m_light = float(g[bw == 255].mean()) if np.any(bw == 255) else 255.0
+    out = img_gray.copy()
+    # If dark region is actually brighter (laser glare or peened highlights), invert.
+    if m_dark > m_light:
+        out = cv2.bitwise_not(out)
+    return out
+
 
 # -------------------------- utilities --------------------------
 
@@ -326,10 +345,18 @@ def process_image_auto_or_forced(
         base_denoised = cv2.medianBlur(base, 3)
 
         if chosen_mode == "log" or method == "log":
+            base = normalize_dark_on_light(base)
+            bg = cv2.blur(base, (1, 31))
+            base = cv2.subtract(base, bg)
+            base = cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX)
             resp = log_response(base_denoised, log_sigma)
             r_est = estimate_radius_from_scale(log_sigma, None)
             header = f"LOG  "
         else:
+            base = normalize_dark_on_light(base)
+            bg = cv2.blur(base, (1, 31))
+            base = cv2.subtract(base, bg)
+            base = cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX)
             resp = dog_response(base_denoised, sigma_small, sigma_large)
             r_est = estimate_radius_from_scale(sigma_small, sigma_large)
             header = f"DOG  "
@@ -366,6 +393,10 @@ def process_image_auto_or_forced(
         else:
             otsu_invert = True
 
+        base = normalize_dark_on_light(base)
+        bg = cv2.blur(base, (1, 31))
+        base = cv2.subtract(base, bg)
+        base = cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX)
         pts_r = laser_centroid_candidates(
             img_gray=base,
             otsu_invert=laser_preset.get("otsu_invert", otsu_invert),
