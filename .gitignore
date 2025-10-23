@@ -4,5 +4,4 @@ data
 yolo11n.pt
 data_gen_tool/validate
 yolo11n-obb.pt
-runs/obb/predict
-runs/obb/predict2
+runs/obb/predict3

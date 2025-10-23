@@ -33,20 +33,16 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def read_image(path: Path):
-    # cv2.imread keeps 8-bit depth; flags=IMREAD_UNCHANGED to preserve channels
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"Failed to read image: {path}")
-    # Convert 16-bit or float to 8-bit for SR
     if img.dtype != 'uint8':
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype('uint8')
-    # Ensure 3-channel for SR
     if len(img.shape) == 2 or img.shape[2] == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     return img
 
 def to_original_channels(sr_bgr, orig_path: Path):
-    # If original was grayscale, write grayscale; else keep BGR
     orig = cv2.imread(str(orig_path), cv2.IMREAD_UNCHANGED)
     if orig is None:
         return sr_bgr
@@ -58,19 +54,29 @@ def to_original_channels(sr_bgr, orig_path: Path):
 def process_one(img_path: Path, out_dir: Path, sr):
     try:
         img = read_image(img_path)
-        up = sr.upsample(img)  # Super-resolution
-        up = to_original_channels(up, img_path)
+        orig_h, orig_w = img.shape[:2]
 
+        # 1️⃣ Apply Super-Resolution
+        up = sr.upsample(img)
+
+        # 2️⃣ Resize back to original dimensions (quality retained)
+        down = cv2.resize(up, (orig_w, orig_h), interpolation=cv2.INTER_AREA)
+
+        # 3️⃣ Restore original channel format (grayscale vs color)
+        down = to_original_channels(down, img_path)
+
+        # 4️⃣ Save output
         rel = img_path.name
         out_path = out_dir / rel
-        # Make sure parent exists (flat dir by default)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(out_path), up)
+        ok = cv2.imwrite(str(out_path), down)
         if not ok:
             raise IOError(f"cv2.imwrite failed for {out_path}")
+
         return (img_path, out_path, None)
     except Exception as e:
         return (img_path, None, e)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Apply Super-Resolution to cropped DMC images.")
@@ -78,7 +84,7 @@ def main():
                     help="Input folder containing cropped/warped images.")
     ap.add_argument("--output", "-o", type=str, default="rectified_crops_sr",
                     help="Output folder for SR images.")
-    ap.add_argument("--model_path", type=str, default="models/super_r/EDSR_x3.pb",
+    ap.add_argument("--model_path", type=str, default="models/super_r/EDSR_x2.pb",
                     help="Path to OpenCV SR model (.pb). e.g., EDSR_x2.pb or EDSR_x3.pb")
     ap.add_argument("--model", type=str, default="edsr",
                     choices=["edsr", "espcn", "fsrcnn", "lapsrn"],
