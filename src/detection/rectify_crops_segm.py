@@ -65,39 +65,6 @@ def order_points_clockwise(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(d)]      # BL
     return rect
 
-
-# def find_mask_corners(poly_px: np.ndarray, H: int, W: int):
-#     """
-#     Build a binary mask from polygon points (pixels),
-#     find its largest contour, and return 4 corners (TL,TR,BR,BL)
-#     that tightly bound the mask. Also returns the binary mask.
-#     """
-#     # Rasterize polygon to mask (pixel domain)
-#     mask = np.zeros((H, W), dtype=np.uint8)
-#     cv2.fillPoly(mask, [poly_px.astype(np.int32)], 255)
-
-#     # Largest contour
-#     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-#     if not contours:
-#         return None, mask
-#     cnt = max(contours, key=cv2.contourArea)
-
-#     # Try to approximate to 4 points (true corners) first
-#     epsilon = 0.01 * cv2.arcLength(cnt, True)
-#     approx = cv2.approxPolyDP(cnt, epsilon, True)
-
-#     if len(approx) == 4:
-#         corners = order_points_clockwise(approx.reshape(4, 2))
-#         return corners, mask
-
-#     # If not 4, fallback: convex hull → min area rectangle → 4 points
-#     hull = cv2.convexHull(cnt)
-#     rect = cv2.minAreaRect(hull)      # ((cx,cy),(w,h),angle)
-#     box = cv2.boxPoints(rect)         # 4x2
-#     corners = order_points_clockwise(box)
-#     return corners, mask
-
-
 def find_mask_corners(poly_px: np.ndarray, H: int, W: int):
     """
     Find 4 extreme corner points (TL, TR, BR, BL) from the mask polygon.
@@ -117,8 +84,6 @@ def find_mask_corners(poly_px: np.ndarray, H: int, W: int):
 
     corners = np.array([tl, tr, br, bl], dtype=np.float32)
     return corners, None
-
-
 
 def perspective_warp(image: np.ndarray, src_pts: np.ndarray, force_square: bool = False):
     """
@@ -195,7 +160,7 @@ def main():
         if conf < args.min_conf:
             continue
 
-        # 1) normalize -> PIXELS (very important!)
+        # 1) normalize -> PIXELS
         poly_px = to_pixels(pts_norm, W, H)
 
         # 2) find corners from the MASK (TL,TR,BR,BL) in PIXELS
