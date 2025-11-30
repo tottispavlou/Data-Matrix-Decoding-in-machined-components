@@ -1,467 +1,324 @@
-import json
-import math
+import cv2
+import numpy as np
+import argparse
 from pathlib import Path
-from dataclasses import dataclass
+from scipy.signal import find_peaks
+from skimage.feature import blob_log
+import matplotlib.pyplot as plt
 
-import cv2
-import numpy as np
+# ================================================================
+#   1.  LOCAL 2–PEAK HISTOGRAM REMAPPING (glare + polarity fix)
+# ================================================================
 
-
-# ---------------------- helpers ----------------------
-
-def load_candidates(json_path: Path):
-    with open(json_path, "r") as f:
-        recs = json.load(f)
-    pts = np.array([[r["x"], r["y"]] for r in recs], dtype=np.float32)
-    return pts
-
-def ensure_dir(p: Path):
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-def to_int_tuple(xy):
-    return (int(round(xy[0])), int(round(xy[1])))
-
-@dataclass
-class GridFitResult:
-    H: np.ndarray                # homography img->rectified
-    rectified: np.ndarray        # square, tight warp (uint8)
-    grid_size: int               # 14 or 16
-    rotation_k: int              # 0..3 (90° steps) applied after warp
-    polarity: int                # +1 bright modules = 1, -1 dark modules = 1
-    cell_centers: np.ndarray     # (N,N,2) centers in rectified image space
-    cell_values: np.ndarray      # (N,N) binarized 0/1 (after polarity fix)
-
-
-# ---------------------- coarse orientation via PCA ----------------------
-
-def coarse_u_v_axes(points: np.ndarray):
+def remap_patch_two_peak(gray_patch):
+    """Remap intensities so that:
+       - background peak → dark
+       - dot peak → bright
+       Uses top 2 histogram peaks in the patch.
     """
-    PCA to get dominant axes. Returns unit vectors u,v (orthonormal).
+    hist, _ = np.histogram(gray_patch.ravel(), bins=256, range=(0, 256))
+    peaks, _ = find_peaks(hist, distance=20)
+
+    if len(peaks) < 2:
+        # fallback: simple normalize
+        return cv2.normalize(gray_patch, None, 0, 255, cv2.NORM_MINMAX)
+
+    # pick strongest 2 peaks
+    top2 = peaks[np.argsort(hist[peaks])[-2:]]
+    p1, p2 = int(top2[0]), int(top2[1])
+
+    bg = min(p1, p2)
+    dot = max(p1, p2)
+
+    dist_bg  = np.abs(gray_patch - bg)
+    dist_dot = np.abs(gray_patch - dot)
+
+    # dot-likeness score
+    dot_score = dist_bg / (dist_bg + dist_dot + 1e-6)
+    dot_score = dot_score ** 3        # sharpen dots
+
+    return (dot_score * 255).astype(np.uint8)
+
+
+def make_local_dot_map(gray):
+    """Splits into 4 quadrants → peak-remap each → stitch."""
+    h, w = gray.shape
+    hh, ww = h // 2, w // 2
+
+    p1 = remap_patch_two_peak(gray[0:hh,   0:ww])
+    p2 = remap_patch_two_peak(gray[0:hh,   ww:w])
+    p3 = remap_patch_two_peak(gray[hh:h,   0:ww])
+    p4 = remap_patch_two_peak(gray[hh:h,   ww:w])
+
+    top = np.hstack((p1, p2))
+    bot = np.hstack((p3, p4))
+    return np.vstack((top, bot))
+
+
+# ================================================================
+#   2.  GRID-AWARE BLOB DETECTION (LoG tied to cell size)
+# ================================================================
+
+def detect_blobs_grid_aware(mapped_img, grid_size, cell_ratio=0.65):
     """
-    pts = points.astype(np.float32)
-    mu = pts.mean(axis=0, keepdims=True)
-    X = pts - mu
-    cov = (X.T @ X) / max(1, len(pts)-1)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    # largest eigenvector = first axis
-    u = eigvecs[:, np.argmax(eigvals)]
-    # enforce a right-handed basis; v = u rotated 90°
-    v = np.array([ -u[1], u[0] ], dtype=np.float32)
-    # normalize
-    u = u / np.linalg.norm(u)
-    v = v / np.linalg.norm(v)
-    return mu.squeeze(), u, v
-
-def rotate_points(points, origin, u, v):
+    Uses LoG blob detection where σ is derived from cell size.
+    Ensures blobs are the right diameter relative to grid.
     """
-    Express points in the (u,v) coordinate frame: (x,y) -> (s,t)
+    h, w = mapped_img.shape
+    cell = min(h, w) / grid_size
+
+    dot_diam = cell * cell_ratio
+    sigma = (dot_diam / 2) / np.sqrt(2)
+
+    min_sigma = sigma * 0.8
+    max_sigma = sigma * 1.2
+
+    img_norm = mapped_img.astype(np.float32) / 255.0
+
+    blobs = blob_log(
+        img_norm,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+        num_sigma=4
+    )
+
+    if blobs.size > 0:
+        blobs[:, 2] *= np.sqrt(2)
+
+    return blobs
+
+
+# ================================================================
+#   3.  LASER LOCAL THRESHOLDING
+# ================================================================
+
+def threshold_laser_local(img_gray):
+    """CLAHE + adaptive local inversion thresholding."""
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8,8))
+    cl = clahe.apply(img_gray)
+
+    thr = cv2.adaptiveThreshold(
+        cl, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 7
+    )
+    return thr
+
+
+# ================================================================
+#   4.  GRID SIDE ANALYSIS (your old logic)
+# ================================================================
+
+def analyze_grid(img_gray, pts, grid_size):
     """
-    rel = points - origin
-    s = rel @ u   # projection on u
-    t = rel @ v   # projection on v
-    return np.stack([s, t], axis=1)
-
-import numpy as np
-import cv2
-from dataclasses import dataclass
-
-@dataclass
-class RansacLine:
-    p0: np.ndarray     # point on line (2,)
-    d: np.ndarray      # unit direction (2,)
-    inliers: np.ndarray  # (M,2)
-
-def fit_line_ransac_points(pts, thresh=2.0, max_trials=1000):
+    Count how many border cells have at least 1 blob.
+    pts = list of (x,y)
     """
-    Minimal 2-point RANSAC for a line with L2 distance in pixels.
-    Returns RansacLine or None.
+    h, w = img_gray.shape
+    step_x = w / grid_size
+    step_y = h / grid_size
+
+    top, bottom, left, right = set(), set(), set(), set()
+
+    for (x, y) in pts:
+        cx = int(x // step_x)
+        cy = int(y // step_y)
+        if not (0 <= cx < grid_size and 0 <= cy < grid_size):
+            continue
+
+        if cy == 0:
+            top.add(cx)
+        elif cy == grid_size - 1:
+            bottom.add(cx)
+
+        if cx == 0:
+            left.add(cy)
+        elif cx == grid_size - 1:
+            right.add(cy)
+
+    return {
+        "top": len(top),
+        "bottom": len(bottom),
+        "left": len(left),
+        "right": len(right)
+    }
+
+
+# ================================================================
+#   5.  READ YOLO LABEL
+# ================================================================
+
+def find_label_for_image(img_path, label_dir):
     """
-    if len(pts) < 2: return None
-    pts = np.asarray(pts, np.float32)
-    best = None
-    rng = np.random.default_rng(123)
-    for _ in range(max_trials):
-        i,j = rng.choice(len(pts), size=2, replace=False)
-        p0, p1 = pts[i], pts[j]
-        d = p1 - p0
-        n = np.linalg.norm(d)
-        if n < 1e-6: continue
-        d /= n
-        # point-line distance
-        v = pts - p0
-        # perp component magnitude
-        dist = np.abs(v[:,0]*(-d[1]) + v[:,1]*(d[0]))
-        inl = pts[dist <= thresh]
-        if best is None or len(inl) > len(best.inliers):
-            best = RansacLine(p0=p0, d=d.copy(), inliers=inl)
-    return best
-
-def angle_between(u,v):
-    cu = u / (np.linalg.norm(u)+1e-9)
-    cv = v / (np.linalg.norm(v)+1e-9)
-    a = np.degrees(np.arccos(np.clip(cu@cv, -1.0, 1.0)))
-    return a
-
-def project_on_line(pts, p0, d):
-    rel = pts - p0
-    t = rel @ d  # 1D coordinate along the line
-    return t
-
-def estimate_spacing_from_inliers(inliers, p0, d):
-    """Median nearest-neighbour gap along the line (robust to outliers)."""
-    t = np.sort(project_on_line(inliers, p0, d))
-    if len(t) < 2: return None
-    gaps = np.diff(t)
-    return float(np.median(gaps)) if len(gaps) else None
-
-def find_L_borders_with_ransac(pts, dist_thresh=2.0, max_trials=1000, ortho_tol=20.0):
+    Takes:   IMGNAME_rectified.png
+    Finds:   IMGNAME.txt
     """
-    Fit two orthogonal, densely populated lines (the solid 'L' borders).
-    Returns (lineA, lineB) or (None,None).
-    """
-    # first line
-    L1 = fit_line_ransac_points(pts, thresh=dist_thresh, max_trials=max_trials)
-    if L1 is None or len(L1.inliers) < 10: return None, None
-    # subtract inliers of L1, then fit second
-    mask = np.ones(len(pts), bool)
-    # compute dist to L1 to mask its inliers
-    v = pts - L1.p0
-    dist = np.abs(v[:,0]*(-L1.d[1]) + v[:,1]*(L1.d[0]))
-    mask[dist <= dist_thresh] = False
-    remain = pts[mask]
-    L2 = fit_line_ransac_points(remain, thresh=dist_thresh, max_trials=max_trials)
-    if L2 is None or len(L2.inliers) < 10: return None, None
-    # ensure near-orthogonal
-    a = angle_between(L1.d, L2.d)
-    if abs(90.0 - a) > ortho_tol:
-        # swap roles and retry: sometimes second fit lands parallel
-        return None, None
-    return L1, L2
+    stem = img_path.stem.replace("_rectified", "")
+    p = label_dir / f"{stem}.txt"
+    return p
 
-def line_intersection(p0a, da, p0b, db):
-    A = np.stack([da, -db], axis=1)  # [da | -db]
-    b = (p0b - p0a)
-    # solve p0a + t*da = p0b + s*db
-    try:
-        ts = np.linalg.lstsq(A, b, rcond=None)[0]
-    except np.linalg.LinAlgError:
+
+def read_label(label_path):
+    """Return (tag, confidence) for the top-conf YOLO label line."""
+    with open(label_path, "r") as f:
+        lines = [l.strip().split() for l in f.readlines() if l.strip()]
+    if not lines:
         return None
-    t = ts[0]
-    return p0a + t*da
+    pairs = [(int(l[0]), float(l[-1])) for l in lines]
+    return max(pairs, key=lambda x: x[1])
 
-def build_corners_from_L(Lleft, Lbottom, N, spacing_u, spacing_v):
+
+# ================================================================
+#   6.  DEBUG PANEL
+# ================================================================
+
+def make_debug_panel(orig, dotmap, blobs, grid_size):
     """
-    Lleft runs along +v (vertical), Lbottom runs along +u (horizontal) or vice-versa.
-    spacing_* are per-module spacings along each border in pixels.
+    Combines:
+    [ original | dotmap | blobs ]
+    into one horizontal debug panel.
     """
-    c00 = line_intersection(Lleft.p0, Lleft.d, Lbottom.p0, Lbottom.d)  # L-corner
-    if c00 is None: return None
-    # choose axis directions so they point into the code area (positive quadrant)
-    u = Lbottom.d / (np.linalg.norm(Lbottom.d)+1e-9)
-    v = Lleft.d   / (np.linalg.norm(Lleft.d)+1e-9)
-    # enforce orthonormal basis
-    u = u / (np.linalg.norm(u)+1e-9)
-    v = np.array([-u[1], u[0]], np.float32) if abs(u@v) > 0.5 else v
-    # corners
-    c10 = c00 + u * spacing_u * (N-1)
-    c01 = c00 + v * spacing_v * (N-1)
-    c11 = c10 + (c01 - c00)
-    return np.stack([c00, c10, c11, c01], axis=0).astype(np.float32)
+    h, w = orig.shape
+    orig_c = cv2.cvtColor(orig, cv2.COLOR_GRAY2BGR)
+    dot_c  = cv2.cvtColor(dotmap, cv2.COLOR_GRAY2BGR)
 
-# ---------------------- estimate spacing & cluster rows/cols ----------------------
+    # draw blobs
+    blob_img = dot_c.copy()
+    for y, x, r in blobs:
+        cv2.circle(blob_img, (int(x), int(y)), int(r), (0,0,255), 1)
 
-def cluster_1d(values: np.ndarray, K: int):
+    panel = np.hstack((orig_c, dot_c, blob_img))
+    return panel
+
+def save_local_histograms(img_gray, out_path):
     """
-    Robust 1D k-means. No initial-labels misuse.
-    Returns (centers_sorted, labels_remapped, compactness).
+    Saves a panel of 4 local histograms (quadrants) + global histogram.
     """
-    vals = values.reshape(-1, 1).astype(np.float32)
-    n = len(vals)
+    h, w = img_gray.shape
 
-    if n == 0:
-        # nothing to cluster
-        return np.array([]), np.array([]), float("inf")
+    # Quadrants
+    q1 = img_gray[0:h//2,     0:w//2]
+    q2 = img_gray[0:h//2,     w//2:w]
+    q3 = img_gray[h//2:h,     0:w//2]
+    q4 = img_gray[h//2:h,     w//2:w]
 
-    # If not enough points for K clusters, bail cleanly with a bad score
-    if n < K:
-        return np.array([]), np.array([]), float("inf")
+    quads = [q1, q2, q3, q4]
 
-    # Degenerate case: all values (almost) the same
-    if float(vals.max() - vals.min()) < 1e-6:
-        # place K tiny-separated centers and assign by nearest
-        centers = np.linspace(vals.min(), vals.max() + 1e-3, K, dtype=np.float32).reshape(-1, 1)
-        # labels by nearest center
-        d = np.abs(vals - centers.T)           # (n, K)
-        labels = np.argmin(d, axis=1).astype(np.int32)
-        compactness = float(np.sum((vals - centers[labels]) ** 2))
-        centers = centers.flatten()
-        # sort centers and remap labels to 0..K-1 in order
-        order = np.argsort(centers)
-        centers = centers[order]
-        lut = {int(o): i for i, o in enumerate(order)}
-        labels = np.vectorize(lambda x: lut[int(x)])(labels)
-        return centers, labels, compactness
+    plt.figure(figsize=(10, 6))
 
-    # Normal case: let OpenCV do kmeans with PP seeding
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-3)
-    compactness, labels, centers = cv2.kmeans(
-        vals, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
-    )
-    centers = centers.flatten()
+    # Plot quadrants
+    for i, q in enumerate(quads):
+        plt.subplot(2, 3, i+1)
+        plt.hist(q.ravel(), bins=32, color='gray')
+        plt.title(f"Quadrant {i+1}")
+        plt.xlim(0, 255)
 
-    # sort centers and remap labels so cluster 0 < cluster 1 < ...
-    order = np.argsort(centers)
-    centers = centers[order]
-    lut = {int(o): i for i, o in enumerate(order)}
-    labels = np.vectorize(lambda x: lut[int(x)])(labels.flatten())
+    # Global histogram
+    plt.subplot(2, 3, 5)
+    plt.hist(img_gray.ravel(), bins=32, color='black')
+    plt.title("GLOBAL")
+    plt.xlim(0, 255)
 
-    return centers, labels, float(compactness)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
 
-def try_grid_size(S_coords: np.ndarray, T_coords: np.ndarray, N: int):
-    """
-    Try fitting an NxN lattice by clustering S and T into N bins.
-    Returns a score (lower is better) and clustering.
-    If clustering fails (not enough points, degenerate), returns +inf score.
-    """
-    s_centers, s_lbl, s_cost = cluster_1d(S_coords, N)
-    t_centers, t_lbl, t_cost = cluster_1d(T_coords, N)
-
-    # If either side failed (e.g., fewer points than N clusters), mark as bad
-    if s_centers.size != N or t_centers.size != N:
-        return float("inf"), (s_centers, s_lbl), (t_centers, t_lbl)
-
-    # spacing regularity penalty
-    s_sp = np.diff(s_centers)
-    t_sp = np.diff(t_centers)
-    mean_sp = (np.mean(s_sp) + np.mean(t_sp)) + 1e-6
-    irreg = (np.std(s_sp) + np.std(t_sp)) / mean_sp
-
-    score = float(s_cost + t_cost) + 1e3 * float(irreg)
-    return score, (s_centers, s_lbl), (t_centers, t_lbl)
-
-
-# ---------------------- build corners & homography ----------------------
-
-def corners_from_clusters(origin, u, v, s_centers, t_centers):
-    """
-    Compute four outer corners from min/max cluster centers in (u,v) frame.
-    """
-    s0, s1 = s_centers[0], s_centers[-1]
-    t0, t1 = t_centers[0], t_centers[-1]
-    # back to image coords: origin + s*u + t*v
-    c00 = origin + s0*u + t0*v
-    c10 = origin + s1*u + t0*v
-    c11 = origin + s1*u + t1*v
-    c01 = origin + s0*u + t1*v
-    return np.stack([c00, c10, c11, c01], axis=0).astype(np.float32)  # clockwise
-
-def homography_to_square(corners, out_size=256):
-    dst = np.array([[0,0],[out_size-1,0],[out_size-1,out_size-1],[0,out_size-1]], np.float32)
-    H = cv2.getPerspectiveTransform(corners, dst)
-    return H
-
-
-# ---------------------- rotation & polarity from ECC200 finder ----------------------
-
-def split_into_cells(rectified: np.ndarray, N: int):
-    h, w = rectified.shape
-    # cell centers (N x N x 2)
-    ys = np.linspace(0.5*h/N, h - 0.5*h/N, N)
-    xs = np.linspace(0.5*w/N, w - 0.5*w/N, N)
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    centers = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
-    return centers
-
-def sample_cells_mean(rectified: np.ndarray, centers: np.ndarray, radius_frac=0.35):
-    """
-    Sample mean intensity in a disk around each center.
-    """
-    H, W = rectified.shape
-    N = centers.shape[0]
-    cell_w = W / N
-    r = int(max(1, round(radius_frac * cell_w)))
-    yy, xx = np.ogrid[-r:r+1, -r:r+1]
-    mask = (xx*xx + yy*yy) <= r*r
-    out = np.zeros((N,N), np.float32)
-    for i in range(N):
-        for j in range(N):
-            cx, cy = centers[i,j]
-            cx = int(round(cx)); cy = int(round(cy))
-            x0 = max(0, cx - r); x1 = min(W, cx + r + 1)
-            y0 = max(0, cy - r); y1 = min(H, cy + r + 1)
-            roi = rectified[y0:y1, x0:x1]
-            m = mask[(y0 - (cy - r)):(y1 - (cy - r)),
-                     (x0 - (cx - r)):(x1 - (cx - r))]
-            if roi.size == 0 or m.size == 0:
-                out[i,j] = 0.0
-            else:
-                out[i,j] = float(roi[m].mean())
-    return out
-
-def rotate_grid(mat, k):
-    return np.rot90(mat, k=k)
-
-def ecc200_finder_score(binary_cells):
-    """
-    Score how well cells match ECC200 border pattern.
-    ECC200: solid 'L' on left and bottom borders; other two borders alternate.
-    Returns higher score for better match.
-    """
-    N = binary_cells.shape[0]
-    # expect left col = 1s, bottom row = 1s
-    left_ok  = np.mean(binary_cells[:,0])
-    bottom_ok= np.mean(binary_cells[-1,:])
-
-    # top row alternating, right col alternating
-    alt = np.arange(N) % 2
-    top_ok   = 1.0 - np.mean(np.abs(binary_cells[0,:] - alt))
-    right_ok = 1.0 - np.mean(np.abs(binary_cells[:, -1] - alt))
-
-    # weight solid L strongly
-    score = 2.0*left_ok + 2.0*bottom_ok + top_ok + right_ok
-    return float(score)
-
-def choose_rotation_and_polarity(rectified: np.ndarray, N: int):
-    # normalize
-    img = rectified.astype(np.float32)
-    img = (img - img.min()) / (img.max() - img.min() + 1e-6)
-
-    centers = split_into_cells(img, N)
-    means = sample_cells_mean(img, centers)
-
-    best = None
-    for polarity in (+1, -1):
-        # polarity: if +1, bright=1; if -1, dark=1
-        cells_val = means if polarity > 0 else 1.0 - means
-        # global threshold (works because cells are already fairly uniform)
-        thr = 0.5 * (cells_val.min() + cells_val.max())
-        binary = (cells_val >= thr).astype(np.float32)
-
-        for k in range(4):  # 0,90,180,270
-            b = rotate_grid(binary, k)
-            score = ecc200_finder_score(b)
-            if (best is None) or (score > best[0]):
-                best = (score, k, polarity, b)
-
-    score, k, pol, bbest = best
-    return k, pol, bbest, centers  # centers correspond to unrotated rectified
-
-
-# ---------------------- master function ----------------------
-
-def fit_and_rectify_from_candidates(
-    crop_gray: np.ndarray,
-    candidates_xy: np.ndarray,
-    possible_sizes=(14,16),
-    out_size=256
-) -> GridFitResult:
-    """
-    Main pipeline assembling all steps.
-    """
-    # 1) coarse axes
-    origin, u, v = coarse_u_v_axes(candidates_xy)
-    st = rotate_points(candidates_xy, origin, u, v)
-    S, T = st[:,0], st[:,1]
-
-    # 2) try sizes
-    best = None
-    for N in possible_sizes:
-        score, (s_c, _), (t_c, _) = try_grid_size(S, T, N)
-        if (best is None) or (score < best[0]):
-            best = (score, N, s_c, t_c)
-    _, N, s_centers, t_centers = best
-
-    # 3) corners & homography
-    corners = corners_from_clusters(origin, u, v, s_centers, t_centers)
-    H = homography_to_square(corners, out_size)
-    rectified = cv2.warpPerspective(crop_gray, H, (out_size, out_size), flags=cv2.INTER_LINEAR)
-
-    # 4) rotation & polarity using ECC200 finder
-    k, pol, cells_bin, centers = choose_rotation_and_polarity(rectified, N)
-    rect_rot = np.rot90(rectified, k=k)
-    # if pol is -1, invert for final “module=1 means bright”
-    rect_final = rect_rot.copy()
-    if pol < 0:
-        rect_final = cv2.bitwise_not(rect_rot)
-
-    # rotate centers as well (for downstream visualization)
-    # (coarse but fine for debugging; decoding usually uses rectified image directly)
-    cell_centers = centers.copy()
-    for _ in range(k):
-        # rotate 90°: (i,j) -> (j, N-1-i)
-        cell_centers = np.transpose(cell_centers, (1,0,2))[::-1,:,:]
-
-    return GridFitResult(
-        H=H,
-        rectified=rect_final.astype(np.uint8),
-        grid_size=N,
-        rotation_k=k,
-        polarity=pol,
-        cell_centers=cell_centers,
-        cell_values=cells_bin.astype(np.uint8),
-    )
-
-def rectify_via_L(pts_xy, crop_gray, try_sizes=(14,16), out_size=256):
-    """
-    pts_xy: (M,2) candidate centers (after detection)
-    Returns (rectified, N, H) or (None,None,None) if failed.
-    """
-    pts = np.asarray(pts_xy, np.float32)
-    # 1) find two orthogonal dense lines = the solid 'L'
-    L1, L2 = find_L_borders_with_ransac(pts, dist_thresh=2.0, max_trials=1200, ortho_tol=20.0)
-    if L1 is None: return None, None, None
-
-    # Decide which is left vs bottom by their image orientation:
-    # left ~ "more vertical" (|dx| < |dy|), bottom ~ "more horizontal".
-    Lvert, Lhoriz = (L1, L2) if abs(L1.d[0]) < abs(L1.d[1]) else (L2, L1)
-
-    # 2) estimate module spacing along each border from its inliers
-    sp_u = estimate_spacing_from_inliers(Lhoriz.inliers, Lhoriz.p0, Lhoriz.d)
-    sp_v = estimate_spacing_from_inliers(Lvert.inliers,  Lvert.p0,  Lvert.d)
-    if sp_u is None or sp_v is None: return None, None, None
-
-    # 3) try N in {14,16} -> build corners -> warp
-    best = None
-    for N in try_sizes:
-        corners = build_corners_from_L(Lvert, Lhoriz, N, sp_u, sp_v)
-        if corners is None: continue
-        dst = np.array([[0,0],[out_size-1,0],[out_size-1,out_size-1],[0,out_size-1]], np.float32)
-        H = cv2.getPerspectiveTransform(corners, dst)
-        rect = cv2.warpPerspective(crop_gray, H, (out_size, out_size), flags=cv2.INTER_LINEAR)
-        # simple quality score: border contrast + straightness (optional: add more)
-        score = float(cv2.Sobel(rect, cv2.CV_32F, 1,0,ksize=3).var() + cv2.Sobel(rect, cv2.CV_32F, 0,1,ksize=3).var())
-        if best is None or score > best[0]:
-            best = (score, N, rect, H)
-    if best is None: return None, None, None
-    _, Nbest, rectified, Hbest = best
-    return rectified, Nbest, Hbest
-
-# ---------------------- CLI wrapper ----------------------
+# ================================================================
+#   7.  MAIN SCRIPT
+# ================================================================
 
 def main():
-    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--img", type=str, required=True, help="Rectified crop image path (grayscale or color).")
-    ap.add_argument("--cand_json", type=str, required=True, help="JSON from dot_candidates.py (same stem).")
-    ap.add_argument("--out", type=str, default="out/rectified_square.png", help="Output rectified square PNG.")
-    ap.add_argument("--size", type=int, default=256, help="Output side length.")
-    ap.add_argument("--try_sizes", type=str, default="14,16", help="Comma-separated possible grid sizes.")
+    ap.add_argument("--imgs", required=True, help="Folder with rectified crops")
+    ap.add_argument("--labels", required=True, help="YOLO label folder")
+    ap.add_argument("--out", required=True, help="Output directory")
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    img = cv2.imread(args.img, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(args.img)
-    pts = load_candidates(Path(args.cand_json))
-    if pts.size == 0:
-        raise RuntimeError("No candidates in JSON.")
+    img_dir = Path(args.imgs)
+    label_dir = Path(args.labels)
+    out_dir = Path(args.out)
+    dbg_dir = out_dir / "_debug"
 
-    sizes = tuple(int(x) for x in args.try_sizes.split(","))
-    res = fit_and_rectify_from_candidates(img, pts, possible_sizes=sizes, out_size=args.size)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.debug:
+        dbg_dir.mkdir(parents=True, exist_ok=True)
 
-    ensure_dir(Path(args.out))
-    cv2.imwrite(args.out, res.rectified)
-    print(f"[OK] grid={res.grid_size} rot={res.rotation_k*90}° pol={'bright=1' if res.polarity>0 else 'dark=1'} -> {args.out}")
+    log_file = open(out_dir / "code_read_log.txt", "w", encoding="utf-8")
+
+    def log(msg):
+        print(msg)
+        log_file.write(msg + "\n")
+
+    img_paths = sorted(img_dir.glob("*.png"))
+
+    for img_path in img_paths:
+        # ----------------------
+        # load image
+        # ----------------------
+        img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img_gray is None:
+            log(f"[WARN] could not read {img_path.name}")
+            continue
+
+        # ----------------------
+        # find YOLO label
+        # ----------------------
+        label_path = find_label_for_image(img_path, label_dir)
+        if not label_path.exists():
+            log(f"[WARN] missing label for {img_path.name}")
+            continue
+
+        label = read_label(label_path)
+        if label is None:
+            log(f"[WARN] empty label for {img_path.name}")
+            continue
+
+        tag, conf = label
+        mode = "dotpeen" if tag == 0 else "laser" if tag == 1 else "unknown"
+
+        log(f"[INFO] Processing {img_path.name} as {mode} (conf={conf:.3f})")
+
+        # ----------------------
+        # DOT-PEENED PIPELINE
+        # ----------------------
+        if mode == "dotpeen":
+            dotmap = make_local_dot_map(img_gray)
+
+            for gs in [14, 16]:
+                blobs = detect_blobs_grid_aware(dotmap, gs)
+                pts = [(int(b[1]), int(b[0])) for b in blobs]
+
+                counts = analyze_grid(img_gray, pts, gs)
+                half = gs // 2
+                L_found = (
+                    (counts["left"] >= half and counts["top"] >= half) or
+                    (counts["top"] >= half and counts["right"] >= half) or
+                    (counts["right"] >= half and counts["bottom"] >= half) or
+                    (counts["bottom"] >= half and counts["left"] >= half)
+                )
+
+                log(f"  Grid {gs}x{gs}: {counts}  L={L_found}")
+
+                if args.debug:
+                    panel = make_debug_panel(img_gray, dotmap, blobs, gs)
+                    cv2.imwrite(str(dbg_dir / f"{img_path.stem}_grid{gs}.jpg"), panel)
+                    histo_path = dbg_dir / f"{img_path.stem}_histo.png"
+                    save_local_histograms(img_gray, histo_path)
+
+        # ----------------------
+        # LASER PIPELINE
+        # ----------------------
+        elif mode == "laser":
+            thr = threshold_laser_local(img_gray)
+            log("  Laser threshold computed.")
+            if args.debug:
+                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser.jpg"), thr)
+
+    log("[OK] Done.")
+    log_file.close()
 
 
 if __name__ == "__main__":

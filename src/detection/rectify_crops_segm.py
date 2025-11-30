@@ -3,7 +3,6 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-
 # -------------------- Label utils --------------------
 
 def parse_line(line: str):
@@ -50,7 +49,6 @@ def to_pixels(pts: np.ndarray, W: int, H: int) -> np.ndarray:
         pts[:, 1] *= H
     return pts
 
-
 # -------------------- Geometry helpers --------------------
 
 def order_points_clockwise(pts: np.ndarray) -> np.ndarray:
@@ -70,10 +68,8 @@ def find_mask_corners(poly_px: np.ndarray, H: int, W: int):
     Find 4 extreme corner points (TL, TR, BR, BL) from the mask polygon.
     Simple manual method using min/max coordinate combinations.
     """
-    # ensure inside image
     poly_px = np.clip(poly_px, [0, 0], [W - 1, H - 1])
 
-    # compute helper metrics
     s = poly_px.sum(axis=1)       # x + y
     diff = poly_px[:, 0] - poly_px[:, 1]  # x - y
 
@@ -119,6 +115,20 @@ def perspective_warp(image: np.ndarray, src_pts: np.ndarray, force_square: bool 
     warped = cv2.warpPerspective(image, M, (Wout, Hout))
     return warped
 
+# -------------------- Resize --------------------
+
+def upscale_if_small(crop: np.ndarray, min_size: int = 60):
+    """
+    If the crop is smaller than min_size in either dimension,
+    upscale it proportionally using nearest-neighbor interpolation.
+    """
+    h, w = crop.shape[:2]
+    if w < min_size or h < min_size:
+        scale = max(min_size / w, min_size / h)
+        new_w, new_h = int(round(w * scale)), int(round(h * scale))
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        print(f"   ↳ Upscaled small crop from {w}x{h} → {new_w}x{new_h}")
+    return crop
 
 # -------------------- Main --------------------
 
@@ -159,31 +169,23 @@ def main():
         cls, pts_norm, conf = max(labels, key=lambda x: x[2])
         if conf < args.min_conf:
             continue
-
-        # 1) normalize -> PIXELS
         poly_px = to_pixels(pts_norm, W, H)
-
-        # 2) find corners from the MASK (TL,TR,BR,BL) in PIXELS
         corners, mask = find_mask_corners(poly_px, H, W)
         if corners is None:
             continue
-
-        # 3) perspective warp with those pixel corners
         crop = perspective_warp(img, corners, force_square=args.square)
 
-        # Save crop
+        crop = upscale_if_small(crop, min_size=60)
+
         out_path = out_dir / f"{img_path.stem}_rectified.png"
         cv2.imwrite(str(out_path), crop)
         saved += 1
 
-        # Debug overlay: cyan = mask outline, red = used crop rectangle
         if args.debug:
             dbg = img.copy()
-            # draw mask outline
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 cv2.drawContours(dbg, contours, -1, (255, 255, 0), 2)
-            # draw rectangle used for warp
             cv2.polylines(dbg, [corners.astype(np.int32)], True, (0, 0, 255), 2)
             cv2.putText(dbg, f"conf={conf:.2f}", tuple(np.int32(corners.mean(axis=0))),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)

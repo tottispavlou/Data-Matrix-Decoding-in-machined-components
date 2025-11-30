@@ -112,7 +112,7 @@ def main():
     ap.add_argument("--exts", nargs="+", default=[".png", ".jpg", ".jpeg"], help="Allowed extensions")
     ap.add_argument("--keep_tree", action="store_true", help="Preserve folder tree under out_dir")
     ap.add_argument("--debug", action="store_true", help="Save side-by-side debug panels to out_dir/_debug")
-    ap.add_argument("--skip_dirs", nargs="+", default=[], help="Relative subfolder names under in_dir to skip (match on any level)")
+    ap.add_argument("--skip_dirs", nargs="+", default="_debug", help="Relative subfolder names under in_dir to skip (match on any level)")
     ap.add_argument("--no_recurse", action="store_true", help="Do not recurse into subfolders")
     args = ap.parse_args()
 
