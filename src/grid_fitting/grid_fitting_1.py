@@ -116,7 +116,7 @@ def save_hist_panel(hists, out_path: Path):
 
 def detect_dots_log(gray: np.ndarray,
                     grid_size_virtual: int = 15,
-                    threshold: float = 0.049):
+                    threshold: float = 0.1):
     """
     LoG tuned by a virtual ~15x15 pitch. (We later map to N=14 and N=16 grids.)
     Returns blobs (y,x,r), gray_used, cell_virtual
@@ -140,9 +140,9 @@ def detect_dots_log(gray: np.ndarray,
         img_norm,
         min_sigma=sigma_min,
         max_sigma=sigma_max,
-        num_sigma=10,
+        num_sigma=12,
         threshold=threshold,
-        overlap=0.5
+        overlap=0.1
     )
     if blobs.size > 0:
         blobs[:, 2] *= np.sqrt(2.0)  # sigma -> radius
