@@ -118,9 +118,9 @@ def detect_dots_log(gray: np.ndarray, grid_size_virtual: int, threshold: float):
         img_norm,
         min_sigma=sigma_min,
         max_sigma=sigma_max,
-        num_sigma=10,
+        num_sigma=6,
         threshold=threshold,
-        overlap=0.1
+        overlap=0.05
     )
     if blobs.size:
         blobs[:, 2] *= np.sqrt(2.0)
@@ -149,6 +149,79 @@ def draw_grid_on_image(vis, N, color=(0, 0, 255), thickness=1):
     for j in range(1, N):
         y = int(round(j * h / N))
         cv2.line(vis, (0, y), (w - 1, y), color, thickness)
+
+def order_corners(pts4):
+    """Same ordering as rectify_crops_segm.py: TL, TR, BR, BL."""
+    pts = np.array(pts4, dtype=np.float32)
+    s = pts.sum(axis=1)
+    d = pts[:, 0] - pts[:, 1]
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmax(d)]
+    bl = pts[np.argmin(d)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def warp_to_square_nearest(gray, corners, out_size=400):
+    """Same warping style as rectify_crops_segm.py (nearest)."""
+    dst = np.array([
+        [0, 0],
+        [out_size - 1, 0],
+        [out_size - 1, out_size - 1],
+        [0, out_size - 1]
+    ], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
+    return cv2.warpPerspective(gray, M, (out_size, out_size), flags=cv2.INTER_NEAREST)
+
+
+def crop_by_quad(gray, quad, pad=10):
+    """
+    Crop image tightly around quad bbox, and shift quad coords into crop space.
+    This prevents black warps when quad extends slightly outside image.
+    """
+    q = np.asarray(quad, dtype=np.float32)
+    h, w = gray.shape[:2]
+    xs = q[:, 0]
+    ys = q[:, 1]
+    x0 = int(max(0, np.floor(xs.min()) - pad))
+    y0 = int(max(0, np.floor(ys.min()) - pad))
+    x1 = int(min(w, np.ceil(xs.max()) + pad))
+    y1 = int(min(h, np.ceil(ys.max()) + pad))
+
+    crop = gray[y0:y1, x0:x1].copy()
+    q_shift = q - np.array([x0, y0], dtype=np.float32)
+    return crop, q_shift, (x0, y0, x1, y1)
+
+
+def intersect_abc(L1, L2):
+    """Intersect two lines in ax+by+c=0 form."""
+    a1, b1, c1 = L1
+    a2, b2, c2 = L2
+    d = a1 * b2 - a2 * b1
+    if abs(d) < 1e-9:
+        return None
+    x = (b1 * c2 - b2 * c1) / d
+    y = (c1 * a2 - c2 * a1) / d
+    return np.array([x, y], dtype=np.float32)
+
+
+def quad_from_abc_lines(lines_abc):
+    """
+    Expect dict with keys: top,right,bottom,left each as (a,b,c).
+    Returns quad TL,TR,BR,BL in pixel coords.
+    """
+    top = lines_abc["top"]
+    right = lines_abc["right"]
+    bottom = lines_abc["bottom"]
+    left = lines_abc["left"]
+
+    TL = intersect_abc(top, left)
+    TR = intersect_abc(top, right)
+    BR = intersect_abc(bottom, right)
+    BL = intersect_abc(bottom, left)
+    if TL is None or TR is None or BR is None or BL is None:
+        return None
+    return np.stack([TL, TR, BR, BL], axis=0).astype(np.float32)
 
 
 def put_debug_text(vis, lines, xy=(10, 18), color=(230, 230, 230), scale=0.5):
@@ -264,8 +337,9 @@ def score_grid_borders(grid):
       dict with rot, grid_rot, counts, L_pair, score, pass_fast
     """
     N = grid.shape[0]
-    min_L = N - 3
-    min_T = (N // 2) - 2  # elastic
+    min_L = (N // 2)
+    min_T = (N // 2) - 2
+    # trying to be elastic
 
     best = None
 
@@ -548,233 +622,263 @@ def try_find_border_iterative_locked(
     max_iters=5,
     max_depth_cells=1.25,
     min_L=None,
-    min_timing=None
+    min_TP=None
 ):
     """
-    Fallback border finder with STRICT PHASE ORDER:
-      1) Find & lock L
-      2) Freeze L forever
-      3) Find & lock timing sides
-      4) Exit ONLY when all 4 sides locked
+    Two-phase fallback:
+      Phase 1: find and lock adjacent L sides
+      Phase 2: reset and lock timing sides
 
-    Uses blob CENTERS only.
+    Blob support counting:
+      A blob counts only if the fitted line passes through
+      the INNER CORE (≈60%) of the blob.
     """
 
     h, w = gray_used.shape
     if len(blobs) < 10:
         return None
 
-    blobs_xy = np.stack([blobs[:, 1], blobs[:, 0]], axis=1)  # (x,y)
+    blobs_xy = np.stack([blobs[:, 1], blobs[:, 0]], axis=1).astype(np.float32)
+    blobs_sigma = blobs[:, 2].astype(np.float32)
 
-    # --- thresholds ---
-    if min_L is None:
-        min_L = N // 2
-    if min_timing is None:
-        min_timing = max(3, (N // 2) - 2)
-
-    # --- cell estimate ---
     cellN = min(h, w) / float(N)
+    band_width = 1.5 * cellN
     band_step = 0.75 * cellN
-    band_width = 1.05 * cellN
     max_depth = max_depth_cells * cellN
-    r_corner = 0.6 * cellN
+
+    if min_L is None:
+        min_L = int(0.65 * N)
+    if min_TP is None:
+        min_TP = int(0.35 * N)
 
     sides = ("top", "right", "bottom", "left")
-
-    locked = {s: None for s in sides}
-    locked_counts = {s: 0 for s in sides}
-
-    active = {s: True for s in sides}
-    freeze = {s: False for s in sides}
+    adj_pairs = [("top", "left"), ("top", "right"),
+                 ("bottom", "left"), ("bottom", "right")]
 
     depth = {s: 0.0 for s in sides}
+    last_try = {s: None for s in sides}
+    locked = {s: None for s in sides}
+    counts = {s: 0 for s in sides}
 
-    last_try = {s: {"L": None, "cnt": 0, "depth": 0.0} for s in sides}
-
-    L_locked = False
-    TP_locked = False
+    phase = "L"
     L_pair = None
 
-    def band_points(side, d):
-        """
-        Select blob centers within a border band at depth d
-        and keep only the outermost points.
-        """
-        if side == "top":
-            mask = blobs_xy[:, 1] < d + band_width
-        elif side == "bottom":
-            mask = blobs_xy[:, 1] > h - (d + band_width)
-        elif side == "left":
-            mask = blobs_xy[:, 0] < d + band_width
-        elif side == "right":
-            mask = blobs_xy[:, 0] > w - (d + band_width)
-        else:
-            return np.zeros((0, 2), dtype=np.float32)
-
-        pts = blobs_xy[mask]
-        if len(pts) == 0:
-            return pts
-
-        # keep only outermost fraction to avoid interior columns
-        k = max(3, int(0.5 * len(pts)))
-
-        if side == "top":
-            idx = np.argsort(pts[:, 1])[:k]
-        elif side == "bottom":
-            idx = np.argsort(pts[:, 1])[-k:]
-        elif side == "left":
-            idx = np.argsort(pts[:, 0])[:k]
-        else:  # right
-            idx = np.argsort(pts[:, 0])[-k:]
-
-        return pts[idx]
-
-
-    def fit_line(pts):
-        if len(pts) < 2:
-            return None
+    def fit_line_vxy(pts):
         vx, vy, x0, y0 = cv2.fitLine(
             pts.astype(np.float32),
-            cv2.DIST_L2,
-            0, 0.01, 0.01
+            cv2.DIST_L2, 0, 0.01, 0.01
         )
-        return (vx[0], vy[0], x0[0], y0[0])
+        return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
 
-    def intersect(L1, L2):
-        if L1 is None or L2 is None:
-            return None
-        v1 = np.array(L1[:2])
-        p1 = np.array(L1[2:])
-        v2 = np.array(L2[:2])
-        p2 = np.array(L2[2:])
-        A = np.stack([v1, -v2], axis=1)
-        if abs(np.linalg.det(A)) < 1e-6:
-            return None
-        t = np.linalg.solve(A, p2 - p1)[0]
-        return p1 + t * v1
+    def count_support(Labc, pts_xy, sig, core_frac=0.6):
+        a, b, c = Labc
+        denom = np.sqrt(a*a + b*b) + 1e-9
+        dist = np.abs(a*pts_xy[:, 0] + b*pts_xy[:, 1] + c) / denom
 
-    def has_corner_blob(pt):
-        d = np.linalg.norm(blobs_xy - pt, axis=1)
-        return np.any(d < r_corner)
+        radius = np.sqrt(2.0) * sig
+        radius = np.clip(radius, 0.25*cellN, 0.9*cellN)
+        core = core_frac * radius
 
-    # =============================
-    # MAIN ITERATION LOOP
-    # =============================
+        return int(np.sum(dist <= core))
+
     for it in range(max_iters):
 
-        for s in sides:
-            if not active[s] or freeze[s]:
+        # ----- UPDATE CANDIDATES -----
+        search_sides = sides if phase == "L" else [s for s in sides if s not in L_pair]
+
+        for s in search_sides:
+            if locked[s] is not None or depth[s] > max_depth:
                 continue
 
-            if depth[s] > max_depth:
-                active[s] = False
-                continue
+            pts_fit, pts_all, sig_all = band_points_with_indices(
+                blobs_xy, blobs_sigma,
+                s, depth[s], band_width, h, w
+            )
 
-            pts = band_points(s, depth[s])
-            cnt = len(pts)
+            if len(pts_fit) >= 2:
+                Lvxy = fit_line_vxy(pts_fit)
+                Labc = line_vxy_to_abc(Lvxy)
+                cnt = count_support(Labc, pts_all, sig_all)
 
-            if cnt >= 2:
-                L = fit_line(pts)
-                last_try[s] = {"L": L, "cnt": cnt, "depth": depth[s]}
-
-                # generic lock (no meaning yet)
-                if not L_locked:
-                    # only lock if it looks like a full L side
-                    if locked[s] is None and cnt >= min_L:
-                        locked[s] = {"vxy": L, "abc": line_vxy_to_abc(L)}
-                        locked_counts[s] = cnt
-                else:
-                    # after L is locked, allow timing lock
-                    if locked[s] is None and cnt >= min_timing:
-                        locked[s] = {"vxy": L, "abc": line_vxy_to_abc(L)}
-                        locked_counts[s] = cnt
+                last_try[s] = {
+                    "vxy": Lvxy,
+                    "abc": Labc,
+                    "cnt": cnt,
+                    "depth": depth[s]
+                }
 
             depth[s] += band_step
 
-        # -------------------------
-        # PHASE 1 — FIND & LOCK L
-        # -------------------------
-        if not L_locked:
-            for s0, s1 in (("top","left"),("top","right"),
-                           ("bottom","left"),("bottom","right")):
+        # ----- PHASE 1: FIND L -----
+        if phase == "L":
+            best = None
 
-                L0 = last_try[s0]["L"]
-                L1 = last_try[s1]["L"]
-                if L0 is None or L1 is None:
-                    continue
-                if locked_counts[s0] < min_L or locked_counts[s1] < min_L:
+            for s0, s1 in adj_pairs:
+                t0 = last_try[s0]
+                t1 = last_try[s1]
+                if t0 is None or t1 is None:
                     continue
 
-                pt = intersect(locked[s0]["vxy"], locked[s1]["vxy"])
-                if pt is None or not has_corner_blob(pt):
-                    continue
+                score = t0["cnt"] + t1["cnt"]
+                if best is None or score > best[0]:
+                    best = (score, s0, s1)
 
-                # LOCK L
-                L_locked = True
-                L_pair = (s0, s1)
+            if best is not None:
+                _, s0, s1 = best
+                if last_try[s0]["cnt"] >= min_L and last_try[s1]["cnt"] >= min_L:
+                    L_pair = (s0, s1)
+                    for s in L_pair:
+                        locked[s] = last_try[s]
+                        counts[s] = last_try[s]["cnt"]
 
-                freeze[s0] = True
-                freeze[s1] = True
-                active[s0] = False
-                active[s1] = False
-                break
+                    # RESET remaining sides
+                    for s in sides:
+                        if s not in L_pair:
+                            depth[s] = 0.0
+                            last_try[s] = None
 
-        # -------------------------
-        # PHASE 2 — LOCK TIMING
-        # -------------------------
-        if L_locked and not TP_locked:
-            remaining = [s for s in sides if not freeze[s]]
+                    phase = "TP"
 
-            for s in remaining:
-                if locked[s] is not None:
-                    freeze[s] = True
-                    active[s] = False
-
-            if all(freeze[s] for s in remaining):
-                TP_locked = True
-
-        # -------------------------
-        # EXIT CONDITION
-        # -------------------------
-        if L_locked and TP_locked:
-            return {
-                "locked": locked,
-                "counts": locked_counts,
-                "L_pair": L_pair,
-                "cell": cellN
-            }
-
-        # -------------------------
-        # DEBUG VIS
-        # -------------------------
-        if dbg_dir is not None:
-            vis = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
+        # ----- PHASE 2: FIND TIMING -----
+        if phase == "TP":
             for s in sides:
-                if last_try[s]["L"] is not None:
-                    draw_infinite_line(
-                        vis,
-                        line_vxy_to_abc(last_try[s]["L"]),
-                        (255, 0, 255),  # magenta = TRY
-                        1
-                    )
-            draw_blobs(vis, blobs, (255,0,0), 1)
-            cv2.imwrite(
-                str(dbg_dir / f"{stem}_N{N}_iter{it:02d}.png"),
-                vis
-            )
+                if s in L_pair or locked[s] is not None:
+                    continue
+                if last_try[s] is not None and last_try[s]["cnt"] >= min_TP:
+                    locked[s] = last_try[s]
+                    counts[s] = last_try[s]["cnt"]
+
+            if all(locked[s] is not None for s in sides):
+                return {
+                    "locked": locked,
+                    "counts": counts,
+                    "L_pair": L_pair,
+                    "cellN": cellN
+                }
+
+        # ----- DEBUG -----
+        if dbg_dir is not None and stem is not None:
+            vis = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
+
+            for s in sides:
+                if last_try[s] is not None:
+                    draw_infinite_line(vis, last_try[s]["abc"], (255, 0, 255), 1)
+                if locked[s] is not None:
+                    draw_infinite_line(vis, locked[s]["abc"], (0, 255, 255), 2)
+
+            draw_blobs(vis, blobs, (255, 0, 0), 1)
+
+            txt = [
+                f"FALLBACK N={N} it={it} phase={phase} L_pair={L_pair}",
+                f"cnts: " + " ".join(f"{s}={last_try[s]['cnt'] if last_try[s] else 0}" for s in sides),
+                f"depths: " + " ".join(f"{s}={depth[s]:.1f}" for s in sides)
+            ]
+            put_debug_text(vis, txt, (10, 18))
+            cv2.imwrite(str(dbg_dir / f"{stem}_N{N}_iter{it:02d}.png"), vis)
 
     return None
 
-def offset_line_outward(Ln, outward_sign, delta):
+def band_points_with_indices(blobs_xy, blobs_sigma, side, depth, band_width, h, w):
     """
-    Line Ln is normalized (unit normal). ax+by+c=0. Shifting along normal by delta:
-      c' = c - delta   if moving in direction of +normal (outward_sign=+1)
-      c' = c + delta   if moving opposite normal (outward_sign=-1)
-    We'll choose outward_sign by testing a point (image center) later.
+    Returns:
+      pts_fit   : (K,2) outermost points for line fitting
+      pts_all   : (M,2) all band points for support counting
+      sig_all   : (M,) sigmas for pts_all
     """
-    a, b, c = Ln
-    return (a, b, float(c - outward_sign * delta))
 
+    if side == "top":
+        mask = blobs_xy[:, 1] < depth + band_width
+    elif side == "bottom":
+        mask = blobs_xy[:, 1] > h - (depth + band_width)
+    elif side == "left":
+        mask = blobs_xy[:, 0] < depth + band_width
+    elif side == "right":
+        mask = blobs_xy[:, 0] > w - (depth + band_width)
+    else:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros((0,))
+
+    pts_all = blobs_xy[mask]
+    sig_all = blobs_sigma[mask]
+
+    if len(pts_all) < 2:
+        return np.zeros((0, 2)), pts_all, sig_all
+
+    # keep outermost ~50% for fitting
+    k = max(3, int(0.5 * len(pts_all)))
+
+    if side == "top":
+        idx = np.argsort(pts_all[:, 1])[:k]
+    elif side == "bottom":
+        idx = np.argsort(pts_all[:, 1])[-k:]
+    elif side == "left":
+        idx = np.argsort(pts_all[:, 0])[:k]
+    else:  # right
+        idx = np.argsort(pts_all[:, 0])[-k:]
+
+    pts_fit = pts_all[idx]
+    return pts_fit, pts_all, sig_all
+
+def offset_lines_for_crop(lines_abc, N, img_shape, inward_frac=0.35):
+    """
+    Offset borders to define a safe crop quad.
+
+    - Primary goal: ensure FULL symbol is inside crop
+    - Prefer outward offset by 0.5*cell_size
+    - If that goes outside image, clamp
+    - Also apply inward safety offset if needed
+
+    Returns: quad corners (TL,TR,BR,BL) in pixel coords
+    """
+
+    h, w = img_shape
+    sides = ("top", "right", "bottom", "left")
+
+    # normalize lines
+    norm = {}
+    for s in sides:
+        a,b,c = lines_abc[s]
+        d = np.sqrt(a*a + b*b) + 1e-9
+        norm[s] = (a/d, b/d, c/d)
+
+    def line_dist(L1, L2):
+        return abs(L1[2] - L2[2])
+
+    # estimate cell size from geometry
+    cell_y = line_dist(norm["top"], norm["bottom"]) / (N - 1)
+    cell_x = line_dist(norm["left"], norm["right"]) / (N - 1)
+    cell_size = 0.5 * (cell_x + cell_y)
+
+    # desired offsets
+    out_delta = 0.5 * cell_size
+    in_delta  = inward_frac * cell_size
+
+    center = np.array([w*0.5, h*0.5], dtype=np.float32)
+
+    offset = {}
+    for s in sides:
+        a,b,c = norm[s]
+        # determine outward direction
+        sign = compute_outward_sign((a,b,c), center)
+
+        # try outward offset
+        c_try = c + sign * out_delta
+
+        # test intersection sanity later; for now accept
+        offset[s] = (a,b,c_try)
+
+    quad = quad_from_abc_lines(offset)
+
+    # if quad is invalid or outside image → fallback to inward offset
+    if quad is None or np.any(quad[:,0] < -5) or np.any(quad[:,1] < -5):
+        offset = {}
+        for s in sides:
+            a,b,c = norm[s]
+            sign = compute_outward_sign((a,b,c), center)
+            c_try = c - sign * in_delta   # inward
+            offset[s] = (a,b,c_try)
+        quad = quad_from_abc_lines(offset)
+
+    return quad
 
 def compute_outward_sign(Ln, center_xy):
     """
@@ -835,7 +939,7 @@ def main():
 
     ap.add_argument("--log_threshold", type=float, default=0.01)
     ap.add_argument("--max_iters", type=int, default=5)
-    ap.add_argument("--max_depth_cells", type=float, default=1.25)
+    ap.add_argument("--max_depth_cells", type=float, default=2)
 
     ap.add_argument("--warp_size", type=int, default=400)
     ap.add_argument("--scale", type=int, default=12)
@@ -987,49 +1091,35 @@ def main():
                 print(f"[FAIL] fallback incomplete (missing sides) for {img_path.name}")
                 continue
 
-            # Offset outward by ~0.55*pitch (lines run through dot centers)
+            # Offset outward by ~0.55*pitch (line fits go through dot centers)
             center_xy = np.array([w * 0.5, h * 0.5], dtype=np.float32)
             delta = 0.55 * float(pitch)
 
-            locked_off = {}
-            for s in ("top", "right", "bottom", "left"):
-                Ln_abc = locked[s]["abc"]  # locked side stored as dict {"vxy":..., "abc":...}
-                sign = compute_outward_sign(Ln_abc, center_xy)
-                locked_off[s] = offset_line_outward(Ln_abc, outward_sign=sign, delta=delta)
+            # --- USE FALLBACK BORDERS DIRECTLY ---
+            lines_abc = {s: locked[s]["abc"] for s in ("top","right","bottom","left")}
 
-            quad = build_quad_from_lines(locked_off)
+            quad = offset_lines_for_crop(
+                lines_abc,
+                N=N,
+                img_shape=gray_pol.shape,
+                inward_frac=0.35
+            )
+
             if quad is None:
-                print(f"[FAIL] quad build failed for {img_path.name}")
                 continue
 
-            # OPTIONAL (recommended): reject degenerate quads
-            q_area = cv2.contourArea(order_quad_TLTRBRBL(quad).astype(np.float32))
-            if q_area < 0.05 * (h * w):
-                print(f"[FAIL] degenerate quad (area too small) for {img_path.name}")
-                continue
+            # crop safely
+            pad = int(0.25 * min(gray_pol.shape))
+            crop, quad_shift, _ = crop_by_quad(gray_pol, quad, pad=pad)
+
+            corners = order_corners(quad_shift)
+            warped = warp_to_square_nearest(crop, corners, out_size=args.warp_size)
 
             if args.debug:
-                vis_q = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
-                draw_blobs(vis_q, blobs, (255, 0, 0), 2)
-                for s in ("top", "right", "bottom", "left"):
-                    draw_infinite_line(vis_q, locked_off[s], (0, 255, 255), 2)
-                q = order_quad_TLTRBRBL(quad)
-                if q is not None:
-                   for i in range(4):
-                      p0 = q[i]
-                      p1 = q[(i + 1) % 4]
-                      cv2.line(vis_q, (int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])), (0, 255, 0), 2)
-                put_debug_text(vis_q, [f"FALLBACK N={N} L_pair={L_pair_fallback} pitch={pitch:.1f}"], (10, 18))
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_fallback_quad.png"), vis_q)
-
-            # Warp (warp gray_used or gray_pol; use gray_used for consistency with dots)
-            warped, H = warp_to_square(gray_used, quad, out_size=args.warp_size)
-            if warped is None:
-                print(f"[FAIL] warp failed for {img_path.name}")
-                continue
-
-            if args.debug:
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_fallback_warped.png"), warped)
+                cv2.imwrite(
+                    str(dbg_dir / f"{img_path.stem}_N{N}_fallback_warped.png"),
+                    warped
+                )
 
             # Re-run blobs on warped
             blobs_w, gray_w, _ = detect_dots_log(warped, grid_size_virtual=15, threshold=args.log_threshold)
@@ -1058,10 +1148,10 @@ def main():
 
             if hyp_w["pass_fast"]:
                 grid_best = hyp_w["grid"]
-                L_pair = hyp_w["L_pair"]
+                L_pair = border["L_pair"]
 
                 grid_final = enforce_L_and_timing_by_sides(
-                    grid_best,
+                    grid_w0,
                     L_pair=L_pair,
                     timing_corner_value=0
                 )
