@@ -49,7 +49,7 @@ def quadrant_polarity_fix(gray: np.ndarray):
     for i, q in enumerate(Q):
         hist = cv2.calcHist([q], [0], None, [256], [0, 256]).flatten()
         hists.append(hist)
-        cand[i] = (int(np.argmax(hist)) > 128)
+        cand[i] = (int(np.argmax(hist)) > 110)
 
     # invert only when adjacent quadrants agree
     invert = [False] * 4
@@ -110,8 +110,8 @@ def detect_dots_log(gray: np.ndarray, grid_size_virtual: int, threshold: float):
 
     dot_radius = 0.5 * cell
     sigma_est = dot_radius / np.sqrt(2.0)
-    sigma_min = max(0.6, 0.65 * sigma_est)
-    sigma_max = 1.1 * sigma_est
+    sigma_min = max(0.6, 0.7 * sigma_est)
+    sigma_max = sigma_est
 
     img_norm = gray.astype(np.float32) / 255.0
     blobs = blob_log(

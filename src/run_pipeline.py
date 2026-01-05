@@ -11,7 +11,7 @@ from preproc.preprocess_gaussian import gaussian_bg_correct
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-YOLO_WEIGHTS = Path("models/runs/segment/train_500syn_100/weights/best.pt")
+YOLO_WEIGHTS = Path("models/runs/segment/250_pre_noaugm/weights/best.pt")
 
 PREPROC_SCRIPT = Path("src/preproc/preprocess_gaussian.py")
 RECTIFY_SCRIPT = Path("src/detection/rectify_crops_segm.py")
@@ -117,7 +117,8 @@ def run_pipeline(image_path: str, save_txt=True):
         "src/detection/rectify_crops_segm.py",
         "--img_dir", rectify_img_dir,
         "--label_dir", rectify_lbl_dir,
-        "--out_dir", rectify_out_dir
+        "--out_dir", rectify_out_dir, 
+        "--debug"
     ], check=True)
 
     print(f"[4] Crop & warp done -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
