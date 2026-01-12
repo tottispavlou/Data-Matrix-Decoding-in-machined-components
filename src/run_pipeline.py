@@ -18,7 +18,7 @@ RECTIFY_SCRIPT = Path("src/detection/rectify_crops_segm.py")
 GRID_SCRIPT = Path("src/grid_fitting/grid_fitting.py")
 
 TMP_DIR = Path("dmc_pipeline")
-TMP_DIR.mkdir(exist_ok=False)
+TMP_DIR.mkdir(exist_ok=True)
 
 # --------------------------------------------------
 # LIBDMTX DECODE
@@ -36,7 +36,6 @@ def decode_dmtx(img_path: Path):
         return None
 
     return res[0].data.decode("ascii", errors="ignore")
-
 
 # --------------------------------------------------
 # PIPELINE
@@ -95,7 +94,7 @@ def run_pipeline(image_path: str, save_txt=True):
     print(f"[3] YOLO detection done -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
 
     # --------------------------------------------------
-    # Step 3: Crop & warp (original image!)
+    # Step 3: Crop & warp
     # --------------------------------------------------
     rectify_img_dir = TMP_DIR / "rectify_imgs"
     rectify_lbl_dir = TMP_DIR / "rectify_labels"
@@ -105,10 +104,7 @@ def run_pipeline(image_path: str, save_txt=True):
     rectify_lbl_dir.mkdir(exist_ok=True)
     rectify_out_dir.mkdir(exist_ok=True)
 
-    # copy original image
     shutil.copy(image_path, rectify_img_dir / image_path.name)
-
-    # copy YOLO label, but RENAME to match image stem
     dst_lbl = rectify_lbl_dir / f"{image_path.stem}.txt"
     shutil.copy(label_path, dst_lbl)
     
@@ -193,7 +189,7 @@ def run_pipeline(image_path: str, save_txt=True):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python src/run_pipeline.py path/to/image.png")
+        print("Usage: python src/run_pipeline.py path/to/image")
         sys.exit(1)
 
     run_pipeline(sys.argv[1])

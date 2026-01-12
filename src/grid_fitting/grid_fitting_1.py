@@ -112,6 +112,24 @@ def process_laser(gray):
 
     return out
 
+def pad_image_quiet_zone(img, pad_modules, scale, value=255):
+    """
+    Pad an image with a quiet zone measured in modules.
+
+    img          : uint8 image (grayscale or binary)
+    pad_modules  : number of modules to pad (e.g. 2)
+    scale        : pixels per module
+    value        : background value (255 = white)
+    """
+    pad_px = int(pad_modules * scale)
+
+    return cv2.copyMakeBorder(
+        img,
+        pad_px, pad_px, pad_px, pad_px,
+        borderType=cv2.BORDER_CONSTANT,
+        value=value
+    )
+
 # ============================================================
 # LoG blobs (dot-peen)
 # ============================================================
@@ -640,9 +658,18 @@ def try_find_border_iterative_locked(
     min_TP=None
 ):
     """
-    Two-phase fallback:
+    Two-phase fallback WITHOUT restarting:
       Phase 1: find and lock adjacent L sides
-      Phase 2: reset and lock timing sides
+      Phase 2: keep searching remaining sides for timing (TP)
+              (no depth reset, no last_try reset)
+
+    Key change:
+      - Maintain BEST line per side across all band expansions.
+      - Locking uses best[s] (not last_try).
+      - Debug draws:
+          * best candidate per side (magenta)
+          * locked L (yellow)
+          * locked TP (cyan)
 
     Blob support counting:
       A blob counts only if the fitted line passes through
@@ -658,8 +685,8 @@ def try_find_border_iterative_locked(
 
     cellN = min(h, w) / float(N)
     band_width = 1.75 * cellN
-    band_step = 0.75 * cellN
-    max_depth = max_depth_cells * cellN
+    band_step  = 0.75 * cellN
+    max_depth  = max_depth_cells * cellN
 
     if min_L is None:
         min_L = int(0.65 * N)
@@ -670,10 +697,19 @@ def try_find_border_iterative_locked(
     adj_pairs = [("top", "left"), ("top", "right"),
                  ("bottom", "left"), ("bottom", "right")]
 
-    depth = {s: 0.0 for s in sides}
-    last_try = {s: None for s in sides}
+    depth  = {s: 0.0 for s in sides}
     locked = {s: None for s in sides}
     counts = {s: 0 for s in sides}
+
+    best = {
+        s: {
+            "vxy": None,
+            "abc": None,
+            "cnt": 0,
+            "depth": None
+        }
+        for s in sides
+    }
 
     phase = "L"
     L_pair = None
@@ -683,7 +719,8 @@ def try_find_border_iterative_locked(
             pts.astype(np.float32),
             cv2.DIST_L2, 0, 0.01, 0.01
         )
-        return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
+        # make scalars (avoids future numpy warnings)
+        return float(vx.ravel()[0]), float(vy.ravel()[0]), float(x0.ravel()[0]), float(y0.ravel()[0])
 
     def count_support(Labc, pts_xy, sig, core_frac=0.6):
         a, b, c = Labc
@@ -698,8 +735,12 @@ def try_find_border_iterative_locked(
 
     for it in range(max_iters):
 
-        # ----- UPDATE CANDIDATES -----
-        search_sides = sides if phase == "L" else [s for s in sides if s not in L_pair]
+        # ----- UPDATE BEST CANDIDATES (monotonic) -----
+        if phase == "L":
+            search_sides = sides
+        else:
+            # keep searching only the non-L sides
+            search_sides = [s for s in sides if (L_pair is None or s not in L_pair)]
 
         for s in search_sides:
             if locked[s] is not None or depth[s] > max_depth:
@@ -710,88 +751,97 @@ def try_find_border_iterative_locked(
                 s, depth[s], band_width, h, w
             )
 
-            if len(pts_fit) >= 2:
+            if pts_fit is not None and len(pts_fit) >= 2:
                 Lvxy = fit_line_vxy(pts_fit)
                 Labc = line_vxy_to_abc(Lvxy)
                 cnt = count_support(Labc, pts_all, sig_all)
 
-                last_try[s] = {
-                    "vxy": Lvxy,
-                    "abc": Labc,
-                    "cnt": cnt,
-                    "depth": depth[s]
-                }
+                # keep ONLY if better than previous best
+                if cnt > best[s]["cnt"]:
+                    best[s] = {
+                        "vxy": Lvxy,
+                        "abc": Labc,
+                        "cnt": cnt,
+                        "depth": depth[s]
+                    }
 
             depth[s] += band_step
 
-        # ----- PHASE 1: FIND L -----
+        # ----- PHASE 1: LOCK L USING BEST (not last_try) -----
         if phase == "L":
-            best = None
-
+            best_pair = None
             for s0, s1 in adj_pairs:
-                t0 = last_try[s0]
-                t1 = last_try[s1]
-                if t0 is None or t1 is None:
+                if best[s0]["abc"] is None or best[s1]["abc"] is None:
                     continue
+                score = best[s0]["cnt"] + best[s1]["cnt"]
+                if best_pair is None or score > best_pair[0]:
+                    best_pair = (score, s0, s1)
 
-                score = t0["cnt"] + t1["cnt"]
-                if best is None or score > best[0]:
-                    best = (score, s0, s1)
-
-            if best is not None:
-                _, s0, s1 = best
-                if last_try[s0]["cnt"] >= min_L and last_try[s1]["cnt"] >= min_L:
+            if best_pair is not None:
+                _, s0, s1 = best_pair
+                if best[s0]["cnt"] >= min_L and best[s1]["cnt"] >= min_L:
                     L_pair = (s0, s1)
-                    for s in L_pair:
-                        locked[s] = last_try[s]
-                        counts[s] = last_try[s]["cnt"]
 
-                    # RESET remaining sides
-                    for s in sides:
-                        if s not in L_pair:
-                            depth[s] = 0.0
-                            last_try[s] = None
+                    for s in L_pair:
+                        locked[s] = best[s]          # store dict with abc/cnt/depth
+                        counts[s] = best[s]["cnt"]
 
                     phase = "TP"
 
-        # ----- PHASE 2: FIND TIMING -----
-        if phase == "TP":
+        # ----- PHASE 2: LOCK TP USING BEST (no reset) -----
+        if phase == "TP" and L_pair is not None:
             for s in sides:
                 if s in L_pair or locked[s] is not None:
                     continue
-                if last_try[s] is not None and last_try[s]["cnt"] >= min_TP:
-                    locked[s] = last_try[s]
-                    counts[s] = last_try[s]["cnt"]
+                if best[s]["abc"] is not None and best[s]["cnt"] >= min_TP:
+                    locked[s] = best[s]
+                    counts[s] = best[s]["cnt"]
 
-            if all(locked[s] is not None for s in sides):
-                return {
-                    "locked": locked,
-                    "counts": counts,
-                    "L_pair": L_pair,
-                    "cellN": cellN
-                }
+            
 
         # ----- DEBUG -----
         if dbg_dir is not None and stem is not None:
             vis = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
 
+            COL_BEST = (255, 0, 255)   # magenta (best candidate)
+            COL_L    = (0, 255, 255)   # yellow (locked L)
+            COL_TP   = (255, 255, 0)   # cyan (locked TP)
+
+            # draw best candidate lines (magenta)
             for s in sides:
-                if last_try[s] is not None:
-                    draw_infinite_line(vis, last_try[s]["abc"], (255, 0, 255), 1)
-                if locked[s] is not None:
-                    draw_infinite_line(vis, locked[s]["abc"], (0, 255, 255), 2)
+                if best[s]["abc"] is not None:
+                    draw_infinite_line(vis, best[s]["abc"], COL_BEST, 1)
+
+            # draw locked lines (L yellow, TP cyan)
+            for s in sides:
+                if locked[s] is None:
+                    continue
+                if L_pair is not None and s in L_pair:
+                    draw_infinite_line(vis, locked[s]["abc"], COL_L, 2)
+                else:
+                    draw_infinite_line(vis, locked[s]["abc"], COL_TP, 2)
 
             draw_blobs(vis, blobs, (255, 0, 0), 1)
 
             txt = [
                 f"FALLBACK N={N} it={it} phase={phase} L_pair={L_pair}",
-                f"cnts: " + " ".join(f"{s}={last_try[s]['cnt'] if last_try[s] else 0}" for s in sides),
-                f"depths: " + " ".join(f"{s}={depth[s]:.1f}" for s in sides)
+                "best_cnts: " + " ".join(f"{s}={best[s]['cnt']}" for s in sides),
+                "depths: " + " ".join(f"{s}={depth[s]:.1f}" for s in sides),
+                f"min_L={min_L} min_TP={min_TP} bw={band_width:.1f} step={band_step:.1f}"
             ]
             put_debug_text(vis, txt, (10, 18))
             cv2.imwrite(str(dbg_dir / f"{stem}_N{N}_iter{it:02d}.png"), vis)
 
+        if all(locked[s] is not None for s in sides):
+            return {
+                "locked": locked,
+                "counts": counts,
+                "L_pair": L_pair,
+                "cellN": cellN
+            }
+
     return None
+
 
 def band_points_with_indices(blobs_xy, blobs_sigma, side, depth, band_width, h, w):
     """
@@ -994,10 +1044,18 @@ def main():
         # LASER
         # -------------------------
         if mode == "laser":
-            thr = process_laser(gray0)
-            cv2.imwrite(str(out_dir / f"{img_path.stem}_laser.png"), thr)
+            laser_img = process_laser(gray0)
+            laser_out = pad_image_quiet_zone(
+                laser_img,
+                pad_modules=args.quiet,
+                scale=args.scale,
+                value=255
+            )
+            cv2.imwrite(str(out_dir / f"{img_path.stem}_laser.png"), laser_out)
+
             if args.debug:
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser_debug.png"), thr)
+                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser_debug.png"), laser_out)
+
             continue
 
         if mode != "dotpeen":
@@ -1043,10 +1101,8 @@ def main():
         solved = False
 
         # -------------------------
-        # FAST PATH: NxN grid over full image (ONLY this N)
+        # FAST PATH: NxN grid over full image
         # -------------------------
-        # You said you added this helper:
-        #   grid0 = fast_grid_fit_whole_image(blobs_xy, (h,w), N)
         grid0 = fast_grid_fit_whole_image(blobs_xy, (h, w), N)
         hyp = score_grid_borders(grid0)
 
@@ -1069,7 +1125,7 @@ def main():
             grid_final = enforce_L_and_timing_by_sides(
                 grid_best,
                 L_pair=L_pair,
-                timing_corner_value=0  # timing-timing corner ALWAYS white
+                timing_corner_value=0
             )
             grid_out = pad_modules(grid_final, pad=args.quiet)
             syn = grid_to_image(grid_out, scale=args.scale)
@@ -1077,7 +1133,7 @@ def main():
             solved = True
 
         # -------------------------
-        # FALLBACK (ONLY if fast failed)
+        # FALLBACK
         # -------------------------
         if not solved:
             border = try_find_border_iterative_locked(

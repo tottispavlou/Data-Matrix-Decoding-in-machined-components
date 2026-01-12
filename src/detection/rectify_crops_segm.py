@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 import cv2
+import pandas as pd
 
 
 # -----------------------------------------------------------
@@ -127,6 +128,7 @@ def main():
     ap.add_argument("--out_dir", default="rectified_crops")
     ap.add_argument("--min_conf", type=float, default=0.0)
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--reso", action="store_true")
     args = ap.parse_args()
 
     img_dir = Path(args.img_dir)
@@ -141,6 +143,7 @@ def main():
     imgs = sorted([p for e in exts for p in img_dir.glob(e)])
 
     saved = 0
+    reso_rows = []
 
     for img_path in imgs:
         label_path = lbl_dir / f"{img_path.stem}.txt"
@@ -180,6 +183,22 @@ def main():
         if not cnts:
             continue
         cnt = max(cnts, key=cv2.contourArea)
+
+        if args.reso:
+            code_area = cv2.contourArea(cnt)
+            image_area = float(H * W)
+            reso_metric = code_area / image_area
+
+            reso_rows.append({
+                "image_name": img_path.name,
+                "image_width_px": W,
+                "image_height_px": H,
+                "image_area_px2": image_area,
+                "code_area_px2": code_area,
+                "code_ratio": reso_metric,
+                "confidence": conf,
+                "num_contour_pts": len(cnt),
+            })
 
         # ----------------------
         # STEP 4: CONVEX HULL
@@ -271,6 +290,12 @@ def main():
             full_debug = cv2.vconcat([row1, row2])
 
             cv2.imwrite(str(out_dir / "_debug" / f"{img_path.stem}_FULL_DEBUG.png"), full_debug)
+
+    if args.reso and reso_rows:
+        df = pd.DataFrame(reso_rows)
+        excel_path = out_dir / "reso_metrics.xlsx"
+        df.to_excel(excel_path, index=False)
+        print(f"[OK] Wrote resolution metrics to {excel_path}")
 
     print(f"[OK] Saved {saved} crops to {out_dir}")
 
