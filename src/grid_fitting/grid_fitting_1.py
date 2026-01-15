@@ -1045,16 +1045,10 @@ def main():
         # -------------------------
         if mode == "laser":
             laser_img = process_laser(gray0)
-            laser_out = pad_image_quiet_zone(
-                laser_img,
-                pad_modules=args.quiet,
-                scale=args.scale,
-                value=255
-            )
-            cv2.imwrite(str(out_dir / f"{img_path.stem}_laser.png"), laser_out)
+            cv2.imwrite(str(out_dir / f"{img_path.stem}_laser.png"), laser_img)
 
             if args.debug:
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser_debug.png"), laser_out)
+                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser_debug.png"), laser_img)
 
             continue
 

@@ -94,15 +94,23 @@ def pick_best_four_corners(pts):
 
 def order_corners(pts):
     pts = np.array(pts, dtype=np.float32)
-    s = pts.sum(axis=1)
-    d = pts[:, 0] - pts[:, 1]
 
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmax(d)]
-    bl = pts[np.argmin(d)]
+    # centroid
+    c = pts.mean(axis=0)
 
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+    # angle of each point around centroid
+    angles = np.arctan2(pts[:,1] - c[1], pts[:,0] - c[0])
+
+    # sort counter-clockwise
+    order = np.argsort(angles)
+    pts = pts[order]
+
+    # rotate so top-left is first
+    idx = np.argmin(pts[:,0] + pts[:,1])
+    pts = np.roll(pts, -idx, axis=0)
+
+    return pts
+
 
 
 def warp_to_square(img, corners, out_size=400):
