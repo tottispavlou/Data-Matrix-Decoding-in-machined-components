@@ -11,14 +11,15 @@ from preproc.preprocess_gaussian import gaussian_bg_correct
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-YOLO_WEIGHTS = Path("models/runs/segment/250_pre_noaugm/weights/best.pt")
+YOLO_WEIGHTS = Path("models/runs/segment/y11s_250s_inv_aug/weights/best.pt")
 
 PREPROC_SCRIPT = Path("src/preproc/preprocess_gaussian.py")
 RECTIFY_SCRIPT = Path("src/detection/rectify_crops_segm.py")
 GRID_SCRIPT = Path("src/grid_fitting/grid_fitting.py")
 
-TMP_DIR = Path("dmc_pipeline")
-TMP_DIR.mkdir(exist_ok=True)
+PIPELINE_ROOT = Path("pipeline_results")
+PIPELINE_ROOT.mkdir(exist_ok=True)
+
 
 # --------------------------------------------------
 # LIBDMTX DECODE
@@ -50,6 +51,9 @@ def run_pipeline(image_path: str, save_txt=True):
 
     print(f"[1] Input image: {image_path}")
 
+    TMP_DIR = PIPELINE_ROOT / f"dmc_pipeline_{image_path.stem}"
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
     # --------------------------------------------------
     # Step 1: Gaussian preprocess
     # --------------------------------------------------
@@ -80,14 +84,14 @@ def run_pipeline(image_path: str, save_txt=True):
         "save_txt=True",
         "save_conf=True",
         "save=False",
-        "project=dmc_pipeline",
+        f"project={TMP_DIR}",
         "name=yolo"
     ], check=True)
 
     label_dir = TMP_DIR / "yolo" / "labels"
     labels = list(label_dir.glob("*.txt"))
     if not labels:
-        print("❌ No YOLO label found")
+        print("[YOLO] No label found")
         return None
 
     label_path = labels[0]
@@ -146,7 +150,7 @@ def run_pipeline(image_path: str, save_txt=True):
 
     subprocess.run([
         sys.executable,
-        "src/grid_fitting/grid_fitting.py",
+        "src/grid_fitting/grid_fitting_1.py",
         "--imgs", grid_img_dir,
         "--labels", grid_lbl_dir,
         "--out", grid_out_dir, 
@@ -170,13 +174,13 @@ def run_pipeline(image_path: str, save_txt=True):
     decoded = decode_dmtx(synthetic_img)
 
     if decoded:
-        print(f"✅ DECODED: {decoded}")
+        print(f"[DECODED]: {decoded}")
         if save_txt:
             out_txt = TMP_DIR / "decoded.txt"
             out_txt.write_text(decoded + "\n")
             print(f"[6] Saved to {out_txt}")
     else:
-        print("❌ libdmtx failed")
+        print("[FAIL] libdmtx failed")
     
     t1 = time.perf_counter()
     print(f"[TIME] Total pipeline time: {(t1 - t0):.3f} s")

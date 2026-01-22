@@ -5,3 +5,5 @@ yolo11n.pt
 data_gen_tool/validate
 yolo11n-obb.pt
 runs/obb/predict3
+models
+runs

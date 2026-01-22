@@ -95,20 +95,11 @@ def process_laser(gray):
     if gray.dtype != np.uint8:
         gray = np.clip(gray, 0, 255).astype(np.uint8)
 
-    # 1) Contrast Limited Adaptive Histogram Equalization (CLAHE)
     clahe = cv2.createCLAHE(
         clipLimit=2.5,
         tileGridSize=(8, 8)
     )
-    eq = clahe.apply(gray)
-
-    # 2) Gentle gamma correction
-    gamma = 0.9  # <1 boosts contrast in bright regions
-    lut = np.array(
-        [(i / 255.0) ** gamma * 255 for i in range(256)],
-        dtype=np.uint8
-    )
-    out = cv2.LUT(eq, lut)
+    out = clahe.apply(gray)
 
     return out
 
@@ -143,7 +134,7 @@ def detect_dots_log(gray: np.ndarray, grid_size_virtual: int, threshold: float):
 
     dot_radius = 0.5 * cell
     sigma_est = dot_radius / np.sqrt(2.0)
-    sigma_min = max(0.6, 0.7 * sigma_est)
+    sigma_min = 0.75 * sigma_est
     sigma_max = sigma_est
 
     img_norm = gray.astype(np.float32) / 255.0
@@ -163,7 +154,6 @@ def detect_dots_log(gray: np.ndarray, grid_size_virtual: int, threshold: float):
     r_max = 0.55 * cell
     blobs = np.array([b for b in blobs if r_min <= b[2] <= r_max], dtype=np.float32)
     return blobs, gray, cell
-
 
 # ============================================================
 # Drawing helpers
@@ -370,7 +360,7 @@ def score_grid_borders(grid):
       dict with rot, grid_rot, counts, L_pair, score, pass_fast
     """
     N = grid.shape[0]
-    min_L = (N // 2) + 1
+    min_L = N - 2
     min_T = (N // 2) -2
     # trying to be elastic
 
@@ -396,7 +386,7 @@ def score_grid_borders(grid):
         L_pair = max(adj, key=lambda p: counts[p[0]] + counts[p[1]])
         T_sides = set(["top", "bottom", "left", "right"]) - set(L_pair)
 
-        # alternation bonus on timing sides (soft)
+        # alternation bonus on timing sides
         alt_bonus = 0.0
         for s in T_sides:
             arr = g[0, :] if s == "top" else g[-1, :] if s == "bottom" else g[:, 0] if s == "left" else g[:, -1]
@@ -405,10 +395,10 @@ def score_grid_borders(grid):
         L_sum = counts[L_pair[0]] + counts[L_pair[1]]
         T_sum = sum(counts[s] for s in T_sides)
 
-        # total score (soft)
+        # total score
         score = float(L_sum) + 0.6 * float(T_sum) + 2.0 * alt_bonus
 
-        # fast-pass condition (elastic)
+        # fast-pass condition
         pass_fast = (
             counts[L_pair[0]] >= min_L and
             counts[L_pair[1]] >= min_L and
@@ -1026,7 +1016,7 @@ def main():
         img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         if img is None:
             continue
-
+        
         gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         if gray0.dtype != np.uint8:
             gray0 = np.clip(gray0, 0, 255).astype(np.uint8)
@@ -1055,6 +1045,8 @@ def main():
         if mode != "dotpeen":
             continue
 
+        solved = False
+
         # -------------------------
         # DOTPEEN: polarity fix
         # -------------------------
@@ -1080,7 +1072,7 @@ def main():
         blobs_xy = np.stack([blobs[:, 1], blobs[:, 0]], axis=1).astype(np.float32)  # (x,y)
 
         # -------------------------
-        # Decide N ONCE (ONLY)
+        # Decide N
         # -------------------------
         # You said you added this helper:
         #   N, pitch = estimate_grid_size_from_blobs(blobs_xy)
@@ -1130,6 +1122,8 @@ def main():
         # FALLBACK
         # -------------------------
         if not solved:
+            fallback_ok = True
+
             border = try_find_border_iterative_locked(
                 blobs=blobs,
                 gray_used=gray_used,
@@ -1141,89 +1135,97 @@ def main():
             )
             if border is None:
                 print(f"[FAIL] fallback failed for N={N}: {img_path.name}")
-                continue
+                fallback_ok = False
 
-            locked = border["locked"]
-            L_pair_fallback = border["L_pair"]
+            if fallback_ok:
+                locked = border["locked"]
 
-            # require all 4 sides
-            if any(locked[s] is None for s in ("top", "right", "bottom", "left")):
-                print(f"[FAIL] fallback incomplete (missing sides) for {img_path.name}")
-                continue
+                if any(locked[s] is None for s in ("top", "right", "bottom", "left")):
+                    print(f"[FAIL] fallback incomplete (missing sides) for {img_path.name}")
+                    fallback_ok = False
 
-            # Offset outward by ~0.55*pitch (line fits go through dot centers)
-            center_xy = np.array([w * 0.5, h * 0.5], dtype=np.float32)
-            delta = 0.55 * float(pitch)
+            if fallback_ok:
+                quad = offset_lines_for_crop(
+                    lines_abc={s: locked[s]["abc"] for s in ("top","right","bottom","left")},
+                    N=N,
+                    img_shape=gray_used.shape,
+                    pitch=pitch
+                )
+                if quad is None:
+                    fallback_ok = False
 
-            # --- USE FALLBACK BORDERS DIRECTLY ---
-            lines_abc = {s: locked[s]["abc"] for s in ("top","right","bottom","left")}
+            if fallback_ok:
+                # crop safely
+                pad = int(0.25 * min(gray_pol.shape))
+                crop, quad_shift, _ = crop_by_quad(gray_pol, quad, pad=pad)
 
-            quad = offset_lines_for_crop(
-                lines_abc={s: locked[s]["abc"] for s in ("top","right","bottom","left")},
-                N=N,
-                img_shape=gray_used.shape,
-                pitch=pitch
-            )
+                corners = order_corners(quad_shift)
+                warped = warp_to_square_nearest(crop, corners, out_size=args.warp_size)
 
-            if quad is None:
-                continue
+                if args.debug:
+                    cv2.imwrite(
+                        str(dbg_dir / f"{img_path.stem}_N{N}_fallback_warped.png"),
+                        warped
+                    )
 
-            # crop safely
-            pad = int(0.25 * min(gray_pol.shape))
-            crop, quad_shift, _ = crop_by_quad(gray_pol, quad, pad=pad)
+                # Re-run blobs on warped
+                blobs_w, gray_w, _ = detect_dots_log(warped, grid_size_virtual=N, threshold=args.log_threshold)
+                if len(blobs_w) < 10:
+                    print(f"[FAIL] too few blobs on warped for {img_path.name}")
+                    fallback_ok = False
 
-            corners = order_corners(quad_shift)
-            warped = warp_to_square_nearest(crop, corners, out_size=args.warp_size)
+            if fallback_ok:
+                blobs_xy_w = np.stack([blobs_w[:, 1], blobs_w[:, 0]], axis=1).astype(np.float32)
+                hw, ww = gray_w.shape
 
-            if args.debug:
+                # FAST grid on warped using SAME N (no re-estimation!)
+                grid_w0 = fast_grid_fit_whole_image(blobs_xy_w, (hw, ww), N)
+                hyp_w = score_grid_borders(grid_w0)
+
+                if args.debug:
+                    vis_w = cv2.cvtColor(gray_w, cv2.COLOR_GRAY2BGR)
+                    draw_grid_on_image(vis_w, N, (0, 0, 255), 1)
+                    draw_blobs(vis_w, blobs_w, (255, 0, 0), 2)
+                    lines = [
+                        f"WARP-FAST N={N} rot={hyp_w['rot']} score={hyp_w['score']:.2f} pass={hyp_w['pass_fast']}",
+                        f"counts: top={hyp_w['counts']['top']} right={hyp_w['counts']['right']} bottom={hyp_w['counts']['bottom']} left={hyp_w['counts']['left']}",
+                        f"L_pair={hyp_w['L_pair']}"
+                    ]
+                    put_debug_text(vis_w, lines, (10, 18))
+                    cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_fallback_grid.png"), vis_w)
+
+                if hyp_w["pass_fast"]:
+                    grid_best = hyp_w["grid"]
+                    L_pair = border["L_pair"]
+
+                    grid_final = enforce_L_and_timing_by_sides(
+                        grid_w0,
+                        L_pair=L_pair,
+                        timing_corner_value=0
+                    )
+                    grid_out = pad_modules(grid_final, pad=args.quiet)
+                    syn = grid_to_image(grid_out, scale=args.scale)
+                    cv2.imwrite(str(out_dir / f"{img_path.stem}_N{N}_synthetic.png"), syn)
+                    solved = True
+                else:
+                    print(f"[FAIL] warp-fast still failed for {img_path.name}")
+
+            if not solved:
+                print(f"[FAIL] dotpeen failed → exporting laser fallback: {img_path.name}")
+
+                # --- LASER FALLBACK ---
+                laserf_img = process_laser(gray0)
+
                 cv2.imwrite(
-                    str(dbg_dir / f"{img_path.stem}_N{N}_fallback_warped.png"),
-                    warped
+                    str(out_dir / f"{img_path.stem}_fallback_laser.png"),
+                    laserf_img
                 )
 
-            # Re-run blobs on warped
-            blobs_w, gray_w, _ = detect_dots_log(warped, grid_size_virtual=15, threshold=args.log_threshold)
-            if len(blobs_w) < 10:
-                print(f"[FAIL] too few blobs on warped for {img_path.name}")
-                continue
-
-            blobs_xy_w = np.stack([blobs_w[:, 1], blobs_w[:, 0]], axis=1).astype(np.float32)
-            hw, ww = gray_w.shape
-
-            # FAST grid on warped using SAME N (no re-estimation!)
-            grid_w0 = fast_grid_fit_whole_image(blobs_xy_w, (hw, ww), N)
-            hyp_w = score_grid_borders(grid_w0)
-
-            if args.debug:
-                vis_w = cv2.cvtColor(gray_w, cv2.COLOR_GRAY2BGR)
-                draw_grid_on_image(vis_w, N, (0, 0, 255), 1)
-                draw_blobs(vis_w, blobs_w, (255, 0, 0), 2)
-                lines = [
-                    f"WARP-FAST N={N} rot={hyp_w['rot']} score={hyp_w['score']:.2f} pass={hyp_w['pass_fast']}",
-                    f"counts: top={hyp_w['counts']['top']} right={hyp_w['counts']['right']} bottom={hyp_w['counts']['bottom']} left={hyp_w['counts']['left']}",
-                    f"L_pair={hyp_w['L_pair']}"
-                ]
-                put_debug_text(vis_w, lines, (10, 18))
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_fallback_grid.png"), vis_w)
-
-            if hyp_w["pass_fast"]:
-                grid_best = hyp_w["grid"]
-                L_pair = border["L_pair"]
-
-                grid_final = enforce_L_and_timing_by_sides(
-                    grid_w0,
-                    L_pair=L_pair,
-                    timing_corner_value=0
-                )
-                grid_out = pad_modules(grid_final, pad=args.quiet)
-                syn = grid_to_image(grid_out, scale=args.scale)
-                cv2.imwrite(str(out_dir / f"{img_path.stem}_N{N}_synthetic.png"), syn)
-                solved = True
-            else:
-                print(f"[FAIL] warp-fast still failed for {img_path.name}")
-
-        if not solved:
-            print(f"[FAIL] could not solve: {img_path.name}")
+                if args.debug:
+                    cv2.imwrite(
+                        str(dbg_dir / f"{img_path.stem}_fallback_laser_debug.png"),
+                        laserf_img
+                    )
 
     print("[OK] Done.")
 

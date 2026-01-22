@@ -124,6 +124,23 @@ def warp_to_square(img, corners, out_size=400):
     M = cv2.getPerspectiveTransform(corners, dst)
     return cv2.warpPerspective(img, M, (out_size, out_size), flags=cv2.INTER_NEAREST)
 
+def expand_quad(quad, img_shape, pad_frac=0.02):
+    """
+    Expand a quad outward from its center by pad_frac.
+    pad_frac is relative to quad size.
+    """
+    quad = quad.astype(np.float32)
+
+    center = quad.mean(axis=0)
+    vecs = quad - center
+
+    quad_exp = center + (1.0 + pad_frac) * vecs
+
+    h, w = img_shape[:2]
+    quad_exp[:, 0] = np.clip(quad_exp[:, 0], 0, w - 1)
+    quad_exp[:, 1] = np.clip(quad_exp[:, 1], 0, h - 1)
+
+    return quad_exp
 
 # -----------------------------------------------------------
 #  MAIN
@@ -231,6 +248,9 @@ def main():
         # STEP 7: ORDERING
         # ----------------------
         corners = order_corners(pts4)
+
+        if cls == 1:
+            corners = expand_quad(corners, img.shape, pad_frac=0.2)
 
         # ----------------------
         # STEP 8: WARP

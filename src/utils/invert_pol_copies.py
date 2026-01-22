@@ -1,8 +1,8 @@
 import os
 import cv2
 
-input_folder = "data/raw/train/images"
-output_folder = "data/raw/train_inverted"
+input_folder = "data/raw/val/images"
+output_folder = "data/raw/val_inverted"
 
 # Create output folder if it does not exist
 os.makedirs(output_folder, exist_ok=True)
