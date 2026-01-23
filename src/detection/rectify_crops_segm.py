@@ -124,7 +124,7 @@ def warp_to_square(img, corners, out_size=400):
     M = cv2.getPerspectiveTransform(corners, dst)
     return cv2.warpPerspective(img, M, (out_size, out_size), flags=cv2.INTER_NEAREST)
 
-def expand_quad(quad, img_shape, pad_frac=0.02):
+def expand_quad(quad, img_shape, pad_frac):
     """
     Expand a quad outward from its center by pad_frac.
     pad_frac is relative to quad size.
@@ -249,13 +249,15 @@ def main():
         # ----------------------
         corners = order_corners(pts4)
 
+        if cls == 0:
+            corners = expand_quad(corners, img.shape, pad_frac=0.02)
         if cls == 1:
-            corners = expand_quad(corners, img.shape, pad_frac=0.2)
+            corners = expand_quad(corners, img.shape, pad_frac=0.1)
 
         # ----------------------
         # STEP 8: WARP
         # ----------------------
-        crop = warp_to_square(img, corners, out_size=400)
+        crop = warp_to_square(img, corners, out_size=200)
         cv2.imwrite(str(out_dir / f"{img_path.stem}_rectified.png"), crop)
         saved += 1
 
@@ -267,7 +269,7 @@ def main():
             def label(im, text):
                 im2 = im.copy()
                 cv2.putText(im2, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,  
-                            0.9, (0, 255, 0), 2)
+                            0.5, (0, 255, 0), 2)
                 return im2
 
             # panel 1: raw mask on original
@@ -306,7 +308,7 @@ def main():
 
             # panel 8: warp result
             dbg8 = crop.copy()
-            dbg8 = label(dbg8, "8: Warp (400x400)")
+            dbg8 = label(dbg8, "8: Warp (240x240)")
 
             # resize each panel
             panels = [dbg1, dbg2, dbg3, dbg4, dbg5, dbg6, dbg7, dbg8]

@@ -62,15 +62,13 @@ def run_batch(
         writer.writerows(results)
 
     print("\n Batch processing complete")
-    print(f"Results saved to: {output_csv.resolve()}")
-
 
 # --------------------------------------------------
 # CLI
 # --------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python src/dmc_batch.py path/to/image_folder")
+        print("Usage: python src/dmc_batch.py data/raw/final_testing_dataset")
         sys.exit(1)
 
     run_batch(Path(sys.argv[1]))

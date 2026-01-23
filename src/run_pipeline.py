@@ -11,7 +11,7 @@ from preproc.preprocess_gaussian import gaussian_bg_correct
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-YOLO_WEIGHTS = Path("models/runs/segment/y11s_250s_inv_aug/weights/best.pt")
+YOLO_WEIGHTS = Path("models/runs/segment/train_250synth_400/weights/best.pt")
 
 PREPROC_SCRIPT = Path("src/preproc/preprocess_gaussian.py")
 RECTIFY_SCRIPT = Path("src/detection/rectify_crops_segm.py")
@@ -117,8 +117,8 @@ def run_pipeline(image_path: str, save_txt=True):
         "src/detection/rectify_crops_segm.py",
         "--img_dir", rectify_img_dir,
         "--label_dir", rectify_lbl_dir,
-        "--out_dir", rectify_out_dir, 
-        "--debug"
+        "--out_dir", rectify_out_dir,
+        "--reso", "--debug"
     ], check=True)
 
     print(f"[4] Crop & warp done -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
@@ -150,10 +150,10 @@ def run_pipeline(image_path: str, save_txt=True):
 
     subprocess.run([
         sys.executable,
-        "src/grid_fitting/grid_fitting_1.py",
+        "src/grid_fitting/grid_fitting_1_updated.py",
         "--imgs", grid_img_dir,
         "--labels", grid_lbl_dir,
-        "--out", grid_out_dir, 
+        "--out", grid_out_dir,
         "--debug"
     ], check=True)
 
@@ -193,7 +193,7 @@ def run_pipeline(image_path: str, save_txt=True):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python src/run_pipeline.py path/to/image")
+        print("Usage: python src/run_pipeline.py data/raw/final_testing_dataset/")
         sys.exit(1)
 
     run_pipeline(sys.argv[1])
