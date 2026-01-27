@@ -11,13 +11,13 @@ from preproc.preprocess_gaussian import gaussian_bg_correct
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-YOLO_WEIGHTS = Path("models/runs/segment/train_250synth_400/weights/best.pt")
+YOLO_WEIGHTS = Path("models/runs/segment/y11n_aug/weights/best.pt")
 
 PREPROC_SCRIPT = Path("src/preproc/preprocess_gaussian.py")
 RECTIFY_SCRIPT = Path("src/detection/rectify_crops_segm.py")
 GRID_SCRIPT = Path("src/grid_fitting/grid_fitting.py")
 
-PIPELINE_ROOT = Path("pipeline_results")
+PIPELINE_ROOT = Path("checking")
 PIPELINE_ROOT.mkdir(exist_ok=True)
 
 
@@ -43,8 +43,9 @@ def decode_dmtx(img_path: Path):
 # --------------------------------------------------
 
 def run_pipeline(image_path: str, save_txt=True):
-    t0 = time.perf_counter()
-    t_stage = time.perf_counter()
+    timings = {}
+    t_total_start = time.perf_counter()
+
 
     image_path = Path(image_path).resolve()
     assert image_path.exists(), "Image not found"
@@ -62,6 +63,7 @@ def run_pipeline(image_path: str, save_txt=True):
     if orig is None:
         raise RuntimeError("Failed to read input image")
 
+    t = time.perf_counter()
     blurred, _, method_used = gaussian_bg_correct(
         orig,
         method="divide",
@@ -70,11 +72,14 @@ def run_pipeline(image_path: str, save_txt=True):
     )
 
     cv2.imwrite(str(preproc_img), blurred)
-    print(f"[2] Gaussian preprocessing done (method={method_used}) -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
+    timings["preprocess"] = time.perf_counter() - t
+
+    print(f"[2] Gaussian preprocessing done (method={method_used})")
 
     # --------------------------------------------------
     # Step 2: YOLO segmentation
     # --------------------------------------------------
+    t = time.perf_counter()
     subprocess.run([
         "yolo",
         "segment",
@@ -95,7 +100,9 @@ def run_pipeline(image_path: str, save_txt=True):
         return None
 
     label_path = labels[0]
-    print(f"[3] YOLO detection done -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
+    timings["yolo"] = time.perf_counter() - t
+
+    print("[3] YOLO detection done")
 
     # --------------------------------------------------
     # Step 3: Crop & warp
@@ -112,16 +119,17 @@ def run_pipeline(image_path: str, save_txt=True):
     dst_lbl = rectify_lbl_dir / f"{image_path.stem}.txt"
     shutil.copy(label_path, dst_lbl)
     
+    t = time.perf_counter()
     subprocess.run([
         sys.executable,
         "src/detection/rectify_crops_segm.py",
         "--img_dir", rectify_img_dir,
         "--label_dir", rectify_lbl_dir,
-        "--out_dir", rectify_out_dir,
-        "--reso", "--debug"
+        "--out_dir", rectify_out_dir
     ], check=True)
 
-    print(f"[4] Crop & warp done -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
+    print("[4] Crop & warp done")
+    timings["rectify"] = time.perf_counter() - t
 
     rectified_imgs = list(rectify_out_dir.glob("*_rectified.png"))
     if not rectified_imgs:
@@ -148,9 +156,10 @@ def run_pipeline(image_path: str, save_txt=True):
 
     synthetic_img = TMP_DIR / "synthetic.png"
 
+    t = time.perf_counter()
     subprocess.run([
         sys.executable,
-        "src/grid_fitting/grid_fitting_1_updated.py",
+        "src/grid_fitting/grid_fitting.py",
         "--imgs", grid_img_dir,
         "--labels", grid_lbl_dir,
         "--out", grid_out_dir,
@@ -166,12 +175,15 @@ def run_pipeline(image_path: str, save_txt=True):
 
     synthetic_img = synthetic_imgs[0]
 
-    print(f"[5] Grid fitting done -- [TIME]: {time.perf_counter() - t_stage:.3f} s")
+    print(f"[5] Grid fitting done")
+    timings["grid_fitting"] = time.perf_counter() - t
 
     # --------------------------------------------------
     # Step 5: libdmtx decode
     # --------------------------------------------------
+    t = time.perf_counter()
     decoded = decode_dmtx(synthetic_img)
+    timings["decode"] = time.perf_counter() - t
 
     if decoded:
         print(f"[DECODED]: {decoded}")
@@ -182,10 +194,11 @@ def run_pipeline(image_path: str, save_txt=True):
     else:
         print("[FAIL] libdmtx failed")
     
-    t1 = time.perf_counter()
-    print(f"[TIME] Total pipeline time: {(t1 - t0):.3f} s")
 
-    return decoded
+    timings["total"] = time.perf_counter() - t_total_start
+
+    return decoded, timings
+
 
 # --------------------------------------------------
 # CLI
@@ -193,7 +206,7 @@ def run_pipeline(image_path: str, save_txt=True):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python src/run_pipeline.py data/raw/final_testing_dataset/")
+        print("Usage: python src/run_pipeline.py data/raw/never_used_pics/")
         sys.exit(1)
 
     run_pipeline(sys.argv[1])

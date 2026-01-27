@@ -6,7 +6,7 @@ import traceback
 from run_pipeline import run_pipeline
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-PIPELINE_ROOT = Path("pipeline_results")
+PIPELINE_ROOT = Path("checking")
 PIPELINE_ROOT.mkdir(exist_ok=True)
 
 def run_batch(
@@ -15,6 +15,9 @@ def run_batch(
 ):
     image_dir = image_dir.resolve()
     assert image_dir.exists(), "Input directory does not exist"
+
+    time_accumulator = {}
+    num_success = 0
 
     images = sorted(
         p for p in image_dir.iterdir()
@@ -34,7 +37,11 @@ def run_batch(
         print(f"[{i}/{len(images)}] Processing: {img_path.name}")
 
         try:
-            decoded = run_pipeline(str(img_path))
+            decoded, timings = run_pipeline(str(img_path))
+            for k, v in timings.items():
+                time_accumulator.setdefault(k, []).append(v)
+
+            num_success += 1
             results.append({
                 "image": img_path.name,
                 "decoded": decoded or "",
@@ -62,6 +69,16 @@ def run_batch(
         writer.writerows(results)
 
     print("\n Batch processing complete")
+
+    print("\nAverage timing over processed images:")
+    for k, values in time_accumulator.items():
+        avg = sum(values) / len(values)
+        print(f"  {k:12s}: {avg:.3f} s")
+
+    if "total" in time_accumulator:
+        print(f"\nAverage TOTAL pipeline time: "
+            f"{sum(time_accumulator['total']) / len(time_accumulator['total']):.3f} s")
+
 
 # --------------------------------------------------
 # CLI

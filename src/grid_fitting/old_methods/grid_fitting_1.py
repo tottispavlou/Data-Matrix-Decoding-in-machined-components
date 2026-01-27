@@ -1,23 +1,7 @@
-# grid_fitting.py
-# Dot-peened: quadrant polarity -> LoG blobs -> rectangular N-grid (14/16) -> per-cell filtering ->
-#             choose L -> corner validation -> (optional) L-anchored regrid -> force borders -> synthetic
-# Laser: simple adaptive threshold
-#
-# Debug outputs (if --debug):
-#  step0:  *_step0_hists.png, *_step0_polarity.png
-#  per N:  *_N{N}_step1_raw_grid_blobs.png (blue blobs + red cell boundaries)
-#          *_N{N}_step2_filtered_grid_blobs.png (green blobs + red cell boundaries)
-#          *_N{N}_step3_regrid.png (ONLY if recalibration triggered)
-#
-# Output:
-#   *_N14_synthetic.png, *_N16_synthetic.png (dotpeen)
-#   *_laser.png (laser)
-
 import argparse
 from pathlib import Path
-
-import cv2
 import numpy as np
+import cv2
 import matplotlib.pyplot as plt
 from skimage.feature import blob_log
 
@@ -34,38 +18,30 @@ def find_label_for_image(img_path: Path, label_dir: Path) -> Path:
 def read_top_label(label_path: Path):
     if not label_path.exists():
         return None
-    lines = []
+    rows = []
     with open(label_path, "r") as f:
         for l in f:
             l = l.strip()
-            if not l:
-                continue
-            parts = l.split()
-            lines.append(parts)
-    if not lines:
+            if l:
+                rows.append(l.split())
+    if not rows:
         return None
-    # assume last token is confidence, first is class
-    pairs = [(int(float(p[0])), float(p[-1])) for p in lines]
+    pairs = [(int(float(p[0])), float(p[-1])) for p in rows]
     return max(pairs, key=lambda x: x[1])
 
 
 # ============================================================
-# Step 0: Quadrant polarity (peak + adjacency rule) + hist debug
+# Quadrant polarity + histogram debug
 # ============================================================
 
 def quadrant_polarity_fix(gray: np.ndarray):
-    """
-    Candidate = quadrant histogram max peak is bright (>128).
-    Invert ONLY if candidate has an adjacent candidate neighbor:
-        TL–TR, TL–BL, TR–BR, BL–BR
-    """
     h, w = gray.shape
     hh, ww = h // 2, w // 2
     Q = [
-        gray[0:hh, 0:ww],   # 0 TL
-        gray[0:hh, ww:w],   # 1 TR
-        gray[hh:h, 0:ww],   # 2 BL
-        gray[hh:h, ww:w],   # 3 BR
+        gray[:hh, :ww],
+        gray[:hh, ww:],
+        gray[hh:, :ww],
+        gray[hh:, ww:]
     ]
 
     cand = [False] * 4
@@ -73,27 +49,21 @@ def quadrant_polarity_fix(gray: np.ndarray):
     for i, q in enumerate(Q):
         hist = cv2.calcHist([q], [0], None, [256], [0, 256]).flatten()
         hists.append(hist)
-        peak = int(np.argmax(hist))
-        cand[i] = (peak > 128)
+        cand[i] = (int(np.argmax(hist)) > 130)
 
-    adj_pairs = [(0, 1), (0, 2), (1, 3), (2, 3)]
-    invert_mask = [False] * 4
-    for a, b in adj_pairs:
+    # invert only when adjacent quadrants agree
+    invert = [False] * 4
+    for a, b in [(0, 1), (0, 2), (1, 3), (2, 3)]:
         if cand[a] and cand[b]:
-            invert_mask[a] = True
-            invert_mask[b] = True
-
-    # isolated / diagonal -> no inversion
-    if not any(invert_mask):
-        invert_mask = [False] * 4
+            invert[a] = True
+            invert[b] = True
 
     fixed = []
     for i, q in enumerate(Q):
-        fixed.append(255 - q if invert_mask[i] else q.copy())
+        fixed.append(255 - q if invert[i] else q.copy())
 
-    top = np.hstack([fixed[0], fixed[1]])
-    bot = np.hstack([fixed[2], fixed[3]])
-    out = np.vstack([top, bot])
+    out = np.vstack([np.hstack([fixed[0], fixed[1]]),
+                     np.hstack([fixed[2], fixed[3]])])
     return out, hists
 
 
@@ -111,280 +81,362 @@ def save_hist_panel(hists, out_path: Path):
 
 
 # ============================================================
-# Step 1: LoG blobs
+# Laser
 # ============================================================
 
-def detect_dots_log(gray: np.ndarray,
-                    grid_size_virtual: int = 15,
-                    threshold: float = 0.1):
+def process_laser(gray):
     """
-    LoG tuned by a virtual ~15x15 pitch. (We later map to N=14 and N=16 grids.)
-    Returns blobs (y,x,r), gray_used, cell_virtual
+    Contrast-only preprocessing for laser-marked DMCs.
+
+    - Enhances dark/light separation
+    - Preserves module shapes
     """
-    if gray.ndim == 3:
-        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
     if gray.dtype != np.uint8:
         gray = np.clip(gray, 0, 255).astype(np.uint8)
 
-    gray_used = gray.copy()
-    h, w = gray_used.shape
+    clahe = cv2.createCLAHE(
+        clipLimit=2.5,
+        tileGridSize=(8, 8)
+    )
+    out = clahe.apply(gray)
+
+    return out
+
+def pad_image_quiet_zone(img, pad_modules, scale, value=255):
+    """
+    Pad an image with a quiet zone measured in modules.
+
+    img          : uint8 image (grayscale or binary)
+    pad_modules  : number of modules to pad (e.g. 2)
+    scale        : pixels per module
+    value        : background value (255 = white)
+    """
+    pad_px = int(pad_modules * scale)
+
+    return cv2.copyMakeBorder(
+        img,
+        pad_px, pad_px, pad_px, pad_px,
+        borderType=cv2.BORDER_CONSTANT,
+        value=value
+    )
+
+# ============================================================
+# LoG blobs (dot-peen)
+# ============================================================
+
+def detect_dots_log(gray: np.ndarray, grid_size_virtual: int, threshold: float):
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+    h, w = gray.shape
     cell = min(h, w) / float(grid_size_virtual)
 
     dot_radius = 0.5 * cell
     sigma_est = dot_radius / np.sqrt(2.0)
-    sigma_min = max(0.6, 0.65 * sigma_est)
-    sigma_max = 1.15 * sigma_est
+    sigma_min = 0.75 * sigma_est
+    sigma_max = sigma_est
 
-    img_norm = gray_used.astype(np.float32) / 255.0
+    img_norm = gray.astype(np.float32) / 255.0
     blobs = blob_log(
         img_norm,
         min_sigma=sigma_min,
         max_sigma=sigma_max,
-        num_sigma=12,
+        num_sigma=8,
         threshold=threshold,
-        overlap=0.1
+        overlap=0.05
     )
-    if blobs.size > 0:
-        blobs[:, 2] *= np.sqrt(2.0)  # sigma -> radius
+    if blobs.size:
+        blobs[:, 2] *= np.sqrt(2.0)
 
-    # loose radius filter (relative to virtual cell)
-    r_min = 0.25 * cell
-    r_max = 1.10 * cell
-    keep = [b for b in blobs if r_min <= b[2] <= r_max]
-    if not keep:
-        return np.zeros((0, 3), dtype=np.float32), gray_used, cell
-
-    return np.array(keep, dtype=np.float32), gray_used, cell
-
+    # strict radius filter to avoid merged / tiny dots
+    r_min = 0.30 * cell
+    r_max = 0.55 * cell
+    blobs = np.array([b for b in blobs if r_min <= b[2] <= r_max], dtype=np.float32)
+    return blobs, gray, cell
 
 # ============================================================
-# Grid drawing (cell boundaries) + blob drawing
+# Drawing helpers
 # ============================================================
 
-def draw_cell_grid(vis: np.ndarray, N: int, color=(0, 0, 255), thickness=1):
-    """Draw N×N cell boundaries (N+1 lines each direction)."""
-    h, w = vis.shape[:2]
-    step_x = w / float(N)
-    step_y = h / float(N)
-
-    # vertical boundaries
-    for k in range(N + 1):
-        x = int(round(k * step_x))
-        cv2.line(vis, (x, 0), (x, h - 1), color, thickness)
-
-    # horizontal boundaries
-    for k in range(N + 1):
-        y = int(round(k * step_y))
-        cv2.line(vis, (0, y), (w - 1, y), color, thickness)
-
-
-def draw_blobs(vis: np.ndarray, blobs: np.ndarray, color_bgr, thickness=2):
+def draw_blobs(vis, blobs, color_bgr, thickness=2):
     for (y, x, r) in blobs:
         cv2.circle(vis, (int(round(x)), int(round(y))), int(round(r)), color_bgr, thickness, cv2.LINE_AA)
 
 
+def draw_grid_on_image(vis, N, color=(0, 0, 255), thickness=1):
+    h, w = vis.shape[:2]
+    for i in range(1, N):
+        x = int(round(i * w / N))
+        cv2.line(vis, (x, 0), (x, h - 1), color, thickness)
+    for j in range(1, N):
+        y = int(round(j * h / N))
+        cv2.line(vis, (0, y), (w - 1, y), color, thickness)
+
+def order_corners(pts4):
+    """Same ordering as rectify_crops_segm.py: TL, TR, BR, BL."""
+    pts = np.array(pts4, dtype=np.float32)
+    s = pts.sum(axis=1)
+    d = pts[:, 0] - pts[:, 1]
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmax(d)]
+    bl = pts[np.argmin(d)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def warp_to_square_nearest(gray, corners, out_size=400):
+    """Same warping style as rectify_crops_segm.py (nearest)."""
+    dst = np.array([
+        [0, 0],
+        [out_size - 1, 0],
+        [out_size - 1, out_size - 1],
+        [0, out_size - 1]
+    ], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
+    return cv2.warpPerspective(gray, M, (out_size, out_size), flags=cv2.INTER_NEAREST)
+
+
+def crop_by_quad(gray, quad, pad=10):
+    """
+    Crop image tightly around quad bbox, and shift quad coords into crop space.
+    This prevents black warps when quad extends slightly outside image.
+    """
+    q = np.asarray(quad, dtype=np.float32)
+    h, w = gray.shape[:2]
+    xs = q[:, 0]
+    ys = q[:, 1]
+    x0 = int(max(0, np.floor(xs.min()) - pad))
+    y0 = int(max(0, np.floor(ys.min()) - pad))
+    x1 = int(min(w, np.ceil(xs.max()) + pad))
+    y1 = int(min(h, np.ceil(ys.max()) + pad))
+
+    crop = gray[y0:y1, x0:x1].copy()
+    q_shift = q - np.array([x0, y0], dtype=np.float32)
+    return crop, q_shift, (x0, y0, x1, y1)
+
+
+def intersect_abc(L1, L2):
+    """Intersect two lines in ax+by+c=0 form."""
+    a1, b1, c1 = L1
+    a2, b2, c2 = L2
+    d = a1 * b2 - a2 * b1
+    if abs(d) < 1e-9:
+        return None
+    x = (b1 * c2 - b2 * c1) / d
+    y = (c1 * a2 - c2 * a1) / d
+    return np.array([x, y], dtype=np.float32)
+
+
+def quad_from_abc_lines(lines_abc):
+    """
+    Expect dict with keys: top,right,bottom,left each as (a,b,c).
+    Returns quad TL,TR,BR,BL in pixel coords.
+    """
+    top = lines_abc["top"]
+    right = lines_abc["right"]
+    bottom = lines_abc["bottom"]
+    left = lines_abc["left"]
+
+    TL = intersect_abc(top, left)
+    TR = intersect_abc(top, right)
+    BR = intersect_abc(bottom, right)
+    BL = intersect_abc(bottom, left)
+    if TL is None or TR is None or BR is None or BL is None:
+        return None
+    return np.stack([TL, TR, BR, BL], axis=0).astype(np.float32)
+
+
+def put_debug_text(vis, lines, xy=(10, 18), color=(230, 230, 230), scale=0.32):
+    x, y = xy
+    for i, t in enumerate(lines):
+        cv2.putText(vis, t, (x, y + 18 * i), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+
+
 # ============================================================
-# Step 2: per-cell filtering + spill check
+# N estimation (14 vs 16): NN pitch + PCA spans
 # ============================================================
 
-def mean_in_circle(gray: np.ndarray, cx: float, cy: float, r: float):
-    """Fast-ish mean in disk via mask ROI."""
-    h, w = gray.shape
-    x0 = max(0, int(cx - r - 2))
-    x1 = min(w, int(cx + r + 3))
-    y0 = max(0, int(cy - r - 2))
-    y1 = min(h, int(cy + r + 3))
-    roi = gray[y0:y1, x0:x1]
-    if roi.size == 0:
-        return 0.0
-
-    yy, xx = np.ogrid[0:roi.shape[0], 0:roi.shape[1]]
-    dx = (xx + x0) - cx
-    dy = (yy + y0) - cy
-    mask = (dx * dx + dy * dy) <= (r * r)
-    vals = roi[mask]
-    return float(np.mean(vals)) if vals.size else 0.0
-
-
-def blob_contrast(gray: np.ndarray, cx: float, cy: float, r: float):
+def estimate_grid_size_from_blobs(blobs_xy):
     """
-    Contrast = |mean(disk r*0.6) - mean(ring [r*1.2..r*1.8])|
-    Works for mixed bright/dark dots (just magnitude).
+    Decide N ∈ {14,16} using blob geometry only.
     """
-    m_in = mean_in_circle(gray, cx, cy, max(1.0, 0.6 * r))
-    m_r1 = mean_in_circle(gray, cx, cy, max(1.0, 1.8 * r))
-    m_r0 = mean_in_circle(gray, cx, cy, max(1.0, 1.2 * r))
-    # ring mean approx via difference (rough)
-    m_ring = max(0.0, m_r1 - m_r0)
-    return abs(m_in - m_ring)
+    if len(blobs_xy) < 10:
+        return None, None
+
+    # Nearest-neighbor distance → pitch
+    from sklearn.neighbors import NearestNeighbors
+    nn = NearestNeighbors(n_neighbors=2).fit(blobs_xy)
+    dists, _ = nn.kneighbors(blobs_xy)
+    pitch = np.median(dists[:, 1])
+
+    # PCA span
+    pts = blobs_xy - blobs_xy.mean(axis=0)
+    _, _, Vt = np.linalg.svd(pts, full_matrices=False)
+    proj = pts @ Vt.T
+    span = max(np.ptp(proj[:, 0]), np.ptp(proj[:, 1]))
+
+    N_est = int(round(span / pitch)) + 1
+
+    # Choose closest valid
+    if abs(N_est - 16) <= abs(N_est - 14):
+        return 16, pitch
+    else:
+        return 14, pitch
+
+def estimate_N_and_pitch(blobs, min_points=20):
+    if len(blobs) < min_points:
+        return None, None
+
+    pts = np.stack([blobs[:, 1], blobs[:, 0]], axis=1).astype(np.float32)  # [x,y]
+    pts = np.round(pts, 1)  # or 0.5
+    _, uniq_idx = np.unique(pts, axis=0, return_index=True)
+    pts = pts[np.sort(uniq_idx)]
+    # nearest-neighbor distances (O(n^2) but n is small-ish here)
+    d2 = np.sum((pts[:, None, :] - pts[None, :, :]) ** 2, axis=2)
+    np.fill_diagonal(d2, np.inf)
+    nn = np.sqrt(np.min(d2, axis=1))
+    pitch = float(np.median(nn))
+    if not np.isfinite(pitch) or pitch < 1.0:
+        return None, None
+
+    # PCA spans
+    mean = pts.mean(axis=0, keepdims=True)
+    X = pts - mean
+    cov = (X.T @ X) / max(1, len(X) - 1)
+    w, V = np.linalg.eigh(cov)  # w ascending
+    V = V[:, np.argsort(w)[::-1]]  # descending
+    uv = X @ V  # principal coords
+    span_u = float(np.percentile(uv[:, 0], 95) - np.percentile(uv[:, 0], 5))
+    span_v = float(np.percentile(uv[:, 1], 95) - np.percentile(uv[:, 1], 5))
+    span = 0.5 * (span_u + span_v)
+    if span <= 0:
+        return None, None
+
+    Nest = int(np.round(span / pitch)) + 1
+    # choose closest among {14,16}
+    candidates = [14, 16]
+    N = min(candidates, key=lambda c: abs(c - Nest))
+    return N, pitch
 
 
-def spill_fraction_sample(cx, cy, r, cell_bounds, samples=40):
+# ============================================================
+# Fast grid fit: lay N×N over whole image
+# ============================================================
+
+def fast_grid_fit_whole_image(blobs_xy, shape_hw, N):
     """
-    Approx area spill using sampled points over disk.
-    If >40% samples fall outside the cell rectangle -> reject.
+    Lay an NxN grid over the whole image.
     """
-    x0, y0, x1, y1 = cell_bounds  # [x0,y0,x1,y1)
-    outside = 0
-    total = 0
+    h, w = shape_hw
+    cw = w / N
+    ch = h / N
 
-    # sample rings: 0.5r, 0.8r, 1.0r
-    radii = [0.5 * r, 0.8 * r, 1.0 * r]
-    for rr in radii:
-        for k in range(samples // len(radii)):
-            ang = 2.0 * np.pi * (k / float(samples // len(radii)))
-            px = cx + rr * np.cos(ang)
-            py = cy + rr * np.sin(ang)
-            total += 1
-            if not (x0 <= px < x1 and y0 <= py < y1):
-                outside += 1
+    grid = np.zeros((N, N), np.uint8)
 
-    return outside / float(max(1, total))
-
-
-def split_cells(N: int, h: int, w: int):
-    """Return per-cell bounds: (i,j)->(x0,y0,x1,y1)."""
-    step_x = w / float(N)
-    step_y = h / float(N)
-    bounds = {}
-    for i in range(N):
-        for j in range(N):
-            x0 = j * step_x
-            x1 = (j + 1) * step_x
-            y0 = i * step_y
-            y1 = (i + 1) * step_y
-            bounds[(i, j)] = (x0, y0, x1, y1)
-    return bounds, step_x, step_y
-
-
-def assign_blobs_to_cells(blobs: np.ndarray, N: int, h: int, w: int):
-    bounds, step_x, step_y = split_cells(N, h, w)
-    per_cell = {(i, j): [] for i in range(N) for j in range(N)}
-    for (y, x, r) in blobs:
-        j = int(x / step_x)
-        i = int(y / step_y)
+    for x, y in blobs_xy:
+        i = int(x / cw)
+        j = int(y / ch)
         if 0 <= i < N and 0 <= j < N:
-            per_cell[(i, j)].append((float(y), float(x), float(r)))
-    return per_cell, bounds, step_x, step_y
+            grid[j, i] = 1
 
-
-def filter_blobs_in_cells(blobs: np.ndarray, gray_for_contrast: np.ndarray, N: int):
-    """
-    Rules:
-      - center decides cell
-      - reject if spill fraction > 0.40
-      - if multiple blobs in cell: keep max(score = r * contrast)
-      - also reject very small blobs (r < 0.30 * cellN)
-    """
-    h, w = gray_for_contrast.shape
-    per_cell, bounds, step_x, step_y = assign_blobs_to_cells(blobs, N, h, w)
-    cellN = min(h, w) / float(N)
-
-    kept = []
-
-    for (i, j), items in per_cell.items():
-        if not items:
-            continue
-        x0, y0, x1, y1 = bounds[(i, j)]
-
-        cand = []
-        for (y, x, r) in items:
-            if r < 0.30 * cellN:
-                continue
-            spill = spill_fraction_sample(x, y, r, (x0, y0, x1, y1), samples=48)
-            if spill > 0.70:
-                continue
-            c = blob_contrast(gray_for_contrast, x, y, r)
-            score = r * c
-            cand.append((score, y, x, r))
-
-        if not cand:
-            continue
-
-        best = max(cand, key=lambda t: t[0])
-        kept.append((best[1], best[2], best[3]))
-
-    if not kept:
-        return np.zeros((0, 3), dtype=np.float32)
-
-    return np.array(kept, dtype=np.float32)
-
-
-def grid_from_blobs_rect(blobs: np.ndarray, N: int, h: int, w: int):
-    """Occupancy grid by center-in-cell."""
-    per_cell, _, _, _ = assign_blobs_to_cells(blobs, N, h, w)
-    grid = np.zeros((N, N), dtype=np.uint8)
-    for (i, j), items in per_cell.items():
-        if items:
-            grid[i, j] = 1
     return grid
 
-
 # ============================================================
-# L selection (strict) + border forcing (strict timing corner white)
+# Border scoring + orientation
 # ============================================================
 
-def choose_L_sides_strict(grid: np.ndarray):
-    N = grid.shape[0]
-    sides = {
-        "top": grid[0, :],
-        "right": grid[:, -1],
-        "bottom": grid[-1, :],
-        "left": grid[:, 0],
-    }
-
-    def stats(arr):
-        count = int(arr.sum())
-        best = cur = 0
-        for v in arr:
-            if v:
-                cur += 1
-                best = max(best, cur)
-            else:
-                cur = 0
-        run_ratio = best / float(N)
-        mean_occ = count / float(N)
-        full = count >= N - 1
-        half = count >= N // 2
-        return dict(count=count, run_ratio=run_ratio, mean_occ=mean_occ, full=full, half=half)
-
-    S = {k: stats(v) for k, v in sides.items()}
-    adj_pairs = [("top", "right"), ("right", "bottom"), ("bottom", "left"), ("left", "top")]
-
-    # rule 1: both full-ish
-    full_pairs = [(a, b) for (a, b) in adj_pairs if S[a]["full"] and S[b]["full"]]
-    if full_pairs:
-        return max(full_pairs, key=lambda p: S[p[0]]["count"] + S[p[1]]["count"])
-
-    # rule 2: both half-ish
-    half_pairs = [(a, b) for (a, b) in adj_pairs if S[a]["half"] and S[b]["half"]]
-    if half_pairs:
-        return max(half_pairs, key=lambda p: S[p[0]]["count"] + S[p[1]]["count"])
-
-    # fallback: run + occupancy
-    def score_side(name):
-        st = S[name]
-        return 1.5 * st["run_ratio"] + 1.0 * st["mean_occ"] + 0.01 * st["count"]
-
-    best_pair, best_score = None, -1e9
-    for a, b in adj_pairs:
-        sc = score_side(a) + score_side(b)
-        if sc > best_score:
-            best_score = sc
-            best_pair = (a, b)
-    return best_pair
+def alternation_score(arr01):
+    # count transitions in a 0/1 array
+    arr = np.asarray(arr01, dtype=np.uint8)
+    if len(arr) < 2:
+        return 0.0
+    return float(np.sum(arr[1:] != arr[:-1])) / float(len(arr) - 1)
 
 
-def enforce_L_and_timing_by_sides(grid: np.ndarray, L_pair):
+def score_grid_borders(grid):
     """
-    Force:
-      - L sides ALL 1
-      - timing sides strict 1010.. starting with black next to L
-      - timing-timing corner ALWAYS 0 (white)
+    Returns best hypothesis:
+      dict with rot, grid_rot, counts, L_pair, score, pass_fast
     """
     N = grid.shape[0]
-    g = grid.copy()
+    min_L = (N // 2) + 1
+    min_T = (N // 2) - 2
+    # trying to be elastic
+
+    best = None
+
+    for rot in range(4):
+        g = np.rot90(grid, rot).copy()
+
+        top = g[0, :]
+        bottom = g[-1, :]
+        left = g[:, 0]
+        right = g[:, -1]
+
+        counts = {
+            "top": int(top.sum()),
+            "bottom": int(bottom.sum()),
+            "left": int(left.sum()),
+            "right": int(right.sum())
+        }
+
+        # choose adjacent pair with max sum as L candidate
+        adj = [("top", "right"), ("right", "bottom"), ("bottom", "left"), ("left", "top")]
+        L_pair = max(adj, key=lambda p: counts[p[0]] + counts[p[1]])
+        T_sides = set(["top", "bottom", "left", "right"]) - set(L_pair)
+
+        # alternation bonus on timing sides
+        alt_bonus = 0.0
+        for s in T_sides:
+            arr = g[0, :] if s == "top" else g[-1, :] if s == "bottom" else g[:, 0] if s == "left" else g[:, -1]
+            alt_bonus += alternation_score(arr)
+
+        L_sum = counts[L_pair[0]] + counts[L_pair[1]]
+        T_sum = sum(counts[s] for s in T_sides)
+
+        # total score
+        score = float(L_sum) + 0.6 * float(T_sum) + 2.0 * alt_bonus
+
+        # fast-pass condition
+        pass_fast = (
+            counts[L_pair[0]] >= min_L and
+            counts[L_pair[1]] >= min_L and
+            all(counts[s] >= min_T for s in T_sides)
+        )
+
+        cand = {
+            "rot": rot,
+            "grid": g,
+            "counts": counts,
+            "L_pair": L_pair,
+            "score": score,
+            "pass_fast": pass_fast
+        }
+
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+
+    return best
+
+
+# ============================================================
+# Border forcing for synthetic grid
+# ============================================================
+
+def enforce_L_and_timing_by_sides(grid, L_pair, timing_corner_value=0):
+    """
+    grid is N×N occupancy. Force:
+      - L sides fully black
+      - timing sides alternating
+      - timing-timing corner forced (user requested: treat as black -> 1)
+    """
+    N = grid.shape[0]
+    g = (grid > 0).astype(np.uint8).copy()
+
     Lset = set(L_pair)
+    all_sides = {"top", "right", "bottom", "left"}
+    Tset = all_sides - Lset
 
     def set_side(name, arr):
         if name == "top":
@@ -396,77 +448,102 @@ def enforce_L_and_timing_by_sides(grid: np.ndarray, L_pair):
         elif name == "right":
             g[:, -1] = arr
 
-    def set_side_const(name, val):
-        set_side(name, np.full(N, val, dtype=np.uint8))
-
-    # L sides full
+    # L sides full black
     for s in Lset:
-        set_side_const(s, 1)
+        set_side(s, np.ones(N, dtype=np.uint8))
 
-    # timing pattern depends on which corner is timing-timing
-    if Lset == {"left", "bottom"}:
-        # timing: top, right ; timing corner = TR must be 0
-        top = np.array([(j % 2 == 0) for j in range(N)], dtype=np.uint8)  # 1,0,1,0.. => TR=0 for even N
-        right = np.array([(i % 2 == 1) for i in range(N)], dtype=np.uint8)  # 0,1,0,1.. => TR=0
-        set_side("top", top)
-        set_side("right", right)
+    # Determine L corner
+    if Lset == {"top", "left"}:
+        Lcorner = (0, 0)
+    elif Lset == {"top", "right"}:
+        Lcorner = (0, N - 1)
+    elif Lset == {"bottom", "left"}:
+        Lcorner = (N - 1, 0)
+    else:
+        Lcorner = (N - 1, N - 1)
 
-    elif Lset == {"bottom", "right"}:
-        # timing: top, left ; timing corner = TL must be 0
-        top = np.array([(j % 2 == 1) for j in range(N)], dtype=np.uint8)   # 0,1,0,1.. => TL=0
-        left = np.array([(i % 2 == 0) for i in range(N)], dtype=np.uint8)  # 0,1,0,1.. => TL=0
-        set_side("top", top)
-        set_side("left", left)
+    # Alternation base
+    alt = np.array([(k % 2 == 0) for k in range(N)], dtype=np.uint8)
 
-    elif Lset == {"right", "top"}:
-        # timing: bottom, left ; timing corner = BL must be 0
-        bottom = np.array([(j % 2 == 1) for j in range(N)], dtype=np.uint8)  # 0,1,0,1.. => BL=0
-        left = np.array([(i % 2 == 1) for i in range(N)], dtype=np.uint8)    # 1,0,1,0.. but we need BL=0 -> start with 1 at TL, BL=0
-        # left currently makes TL=0 if i%2==0; we want TL=1 here (connected to L), BL=0 ok -> use i%2==0? no.
-        # For (right,top) L corner is TR, so TL is timing+L? Actually TL is timing+? Top is L, left is timing. TL touches top(L), so TL should be 1.
-        left = np.array([(i % 2 == 0) for i in range(N)], dtype=np.uint8)    # TL=1, BL=0
-        set_side("bottom", bottom)
-        set_side("left", left)
+    # set timing sides
+    for s in Tset:
+        if s in ("top", "bottom"):
+            arr = alt.copy()
+            if Lcorner[1] == N - 1:
+                arr = arr[::-1]
+            set_side(s, arr)
+        else:
+            arr = alt.copy()
+            if Lcorner[0] == N - 1:
+                arr = arr[::-1]
+            set_side(s, arr)
 
-    elif Lset == {"top", "left"}:
-        # timing: bottom, right ; timing corner = BR must be 0
-        bottom = np.array([(j % 2 == 0) for j in range(N)], dtype=np.uint8)  # 1,0.. => BL=1, BR=0
-        right = np.array([(i % 2 == 0) for i in range(N)], dtype=np.uint8)   # 1,0.. => TR=1, BR=0
-        set_side("bottom", bottom)
-        set_side("right", right)
+    # timing-timing corner forced (per user's latest note)
+    if Tset == {"top", "right"}:
+        g[0, N - 1] = timing_corner_value
+    elif Tset == {"top", "left"}:
+        g[0, 0] = timing_corner_value
+    elif Tset == {"bottom", "right"}:
+        g[N - 1, N - 1] = timing_corner_value
+    elif Tset == {"bottom", "left"}:
+        g[N - 1, 0] = timing_corner_value
 
     return g
 
 
-def timing_corner_for_Lpair(L_pair):
-    """Return which corner is timing-timing (allowed empty) given L_pair."""
-    Lset = set(L_pair)
-    timing = {"top", "right", "bottom", "left"} - Lset
-    timing = tuple(sorted(list(timing)))
-    # timing corner = intersection of timing sides
-    if set(timing) == {"top", "right"}:
-        return (0, -1)     # TR
-    if set(timing) == {"right", "bottom"}:
-        return (-1, -1)    # BR
-    if set(timing) == {"bottom", "left"}:
-        return (-1, 0)     # BL
-    if set(timing) == {"left", "top"}:
-        return (0, 0)      # TL
-    # should not happen
-    return (0, 0)
+# ============================================================
+# Synthetic output: binary + 2-module quiet zone
+# ============================================================
+
+def pad_modules(grid, pad=2):
+    N = grid.shape[0]
+    out = np.zeros((N + 2 * pad, N + 2 * pad), dtype=np.uint8)  # 0 means white in render
+    out[pad:pad + N, pad:pad + N] = grid
+    return out
+
+
+def grid_to_image(grid, scale=12):
+    g = (grid > 0).astype(np.uint8)
+    img = (1 - g) * 255
+    N = img.shape[0]
+    out = cv2.resize(img, (N * scale, N * scale), interpolation=cv2.INTER_NEAREST)
+    return out.astype(np.uint8)
 
 
 # ============================================================
-# Step 4: L-anchored regrid (only when needed)
+# Fallback: border finding via iterative bands + RANSAC on centers
 # ============================================================
 
-def ransac_line(points, iters=500, thresh=2.5):
-    pts = np.asarray(points, dtype=np.float32)
+def normalize_line(L):
+    a, b, c = L
+    n = float(np.hypot(a, b) + 1e-8)
+    return (float(a / n), float(b / n), float(c / n))
+
+def line_vxy_to_abc(L):
+    """
+    Convert cv2.fitLine format (vx, vy, x0, y0)
+    to normalized ax + by + c = 0
+    """
+    vx, vy, x0, y0 = L
+    a = -vy
+    b = vx
+    c = vy * x0 - vx * y0
+
+    n = np.hypot(a, b)
+    if n > 0:
+        a /= n
+        b /= n
+        c /= n
+
+    return (a, b, c)
+
+def ransac_line_centers(points_xy: np.ndarray, iters=900, dist_thresh=2.5):
+    pts = np.asarray(points_xy, dtype=np.float32)
     if len(pts) < 2:
-        return None, None
+        return None, np.array([], dtype=np.int32)
 
-    best_model = None
-    best_inliers = []
+    best_L = None
+    best_inl = np.array([], dtype=np.int32)
 
     for _ in range(iters):
         i1, i2 = np.random.randint(0, len(pts), 2)
@@ -480,18 +557,15 @@ def ransac_line(points, iters=500, thresh=2.5):
         a = y1 - y2
         b = x2 - x1
         c = x1 * y2 - x2 * y1
-        denom = np.hypot(a, b)
-        if denom < 1e-8:
-            continue
+        Ln = normalize_line((a, b, c))
 
-        d = np.abs(a * pts[:, 0] + b * pts[:, 1] + c) / denom
-        inliers = np.where(d < thresh)[0]
+        d = np.abs(Ln[0] * pts[:, 0] + Ln[1] * pts[:, 1] + Ln[2])
+        inl = np.where(d < dist_thresh)[0]
+        if len(inl) > len(best_inl):
+            best_inl = inl
+            best_L = Ln
 
-        if len(inliers) > len(best_inliers):
-            best_inliers = inliers
-            best_model = (a, b, c)
-
-    return best_model, best_inliers
+    return best_L, best_inl
 
 
 def intersect_lines(L1, L2):
@@ -505,121 +579,453 @@ def intersect_lines(L1, L2):
     return np.array([x, y], dtype=np.float32)
 
 
-def line_direction(L):
-    """Return a unit direction vector along the line."""
-    a, b, _ = L
-    # line normal is (a,b) => direction is (-b, a)
-    t = np.array([-b, a], dtype=np.float32)
-    n = np.linalg.norm(t)
-    if n < 1e-8:
-        return np.array([1.0, 0.0], dtype=np.float32)
-    return t / n
+def draw_infinite_line(vis, L, color, thickness=2):
+    h, w = vis.shape[:2]
+    a, b, c = L
+    if abs(b) > abs(a):
+        x0, x1 = 0, w - 1
+        y0 = int(round((-a * x0 - c) / (b + 1e-8)))
+        y1 = int(round((-a * x1 - c) / (b + 1e-8)))
+        cv2.line(vis, (x0, y0), (x1, y1), color, thickness)
+    else:
+        y0, y1 = 0, h - 1
+        x0 = int(round((-b * y0 - c) / (a + 1e-8)))
+        x1 = int(round((-b * y1 - c) / (a + 1e-8)))
+        cv2.line(vis, (x0, y0), (x1, y1), color, thickness)
 
 
-def choose_sign_toward_center(origin, t, center):
-    """Pick +t or -t to point toward image center."""
-    v = center - origin
-    return t if float(np.dot(v, t)) >= 0 else -t
+def side_band_points(blobs_xy, h, w, side, depth, band_width):
+    x = blobs_xy[:, 0]
+    y = blobs_xy[:, 1]
+    if side == "top":
+        m = y < (depth + band_width)
+    elif side == "bottom":
+        m = y > (h - (depth + band_width))
+    elif side == "left":
+        m = x < (depth + band_width)
+    elif side == "right":
+        m = x > (w - (depth + band_width))
+    else:
+        m = np.zeros((len(blobs_xy),), dtype=bool)
+    return blobs_xy[m]
 
 
-def project_along(vectors, origin, dir_unit):
-    """Project points onto dir."""
-    rel = vectors - origin[None, :]
-    return rel @ dir_unit
+def select_outermost_points(pts, side, k):
+    if len(pts) <= k:
+        return pts
+    if side == "top":
+        return pts[np.argsort(pts[:, 1])[:k]]
+    if side == "bottom":
+        return pts[np.argsort(pts[:, 1])[-k:]]
+    if side == "left":
+        return pts[np.argsort(pts[:, 0])[:k]]
+    if side == "right":
+        return pts[np.argsort(pts[:, 0])[-k:]]
+    return pts
 
 
-def robust_pitch_from_points(points_xy, origin, dir_unit, min_needed=5):
-    """Median spacing of sorted projections."""
-    if len(points_xy) < min_needed:
-        return None
-    pts = np.asarray(points_xy, dtype=np.float32)
-    s = np.sort(project_along(pts, origin, dir_unit))
-    if len(s) < min_needed:
-        return None
-    ds = np.diff(s)
-    ds = ds[ds > 1e-3]
-    if ds.size < 3:
-        return None
-    return float(np.median(ds))
+def has_blob_near_point(blobs_xy, p_xy, r):
+    if p_xy is None:
+        return False
+    d = np.linalg.norm(blobs_xy - p_xy[None, :], axis=1)
+    return bool(np.any(d <= r))
 
 
-def regrid_from_predicted_L(blobs, img_shape, N, L_pair):
+def choose_L_sides_from_border_counts(counts):
+    adj = [("top", "right"), ("right", "bottom"), ("bottom", "left"), ("left", "top")]
+    return max(adj, key=lambda p: int(counts.get(p[0], 0)) + int(counts.get(p[1], 0)))
+
+
+def try_find_border_iterative_locked(
+    blobs,
+    gray_used,
+    N,
+    dbg_dir=None,
+    stem=None,
+    max_iters=5,
+    max_depth_cells=1.25,
+    min_L=None,
+    min_TP=None
+):
     """
-    Build a perfect rectangular grid anchored on the predicted L.
-    Borders are assumed perfect; blobs are used ONLY for interior occupancy.
+    Two-phase fallback WITHOUT restarting:
+      Phase 1: find and lock adjacent L sides
+      Phase 2: keep searching remaining sides for timing (TP)
+              (no depth reset, no last_try reset)
+
+    Key change:
+      - Maintain BEST line per side across all band expansions.
+      - Locking uses best[s] (not last_try).
+      - Debug draws:
+          * best candidate per side (magenta)
+          * locked L (yellow)
+          * locked TP (cyan)
+
+    Blob support counting:
+      A blob counts only if the fitted line passes through
+      the INNER CORE (≈60%) of the blob.
     """
-    h, w = img_shape
-    grid = np.zeros((N, N), dtype=np.uint8)
 
-    # cell size from image bounds
-    cell_x = w / float(N)
-    cell_y = h / float(N)
+    h, w = gray_used.shape
+    if len(blobs) < 10:
+        return None
 
-    # precompute blob centers
-    pts = np.stack([blobs[:, 1], blobs[:, 0]], axis=1) if len(blobs) else np.zeros((0,2))
+    blobs_xy = np.stack([blobs[:, 1], blobs[:, 0]], axis=1).astype(np.float32)
+    blobs_sigma = blobs[:, 2].astype(np.float32)
 
-    # fill interior cells only
-    for i in range(N):
-        for j in range(N):
-            # skip borders (they will be forced later)
-            if i == 0 or i == N-1 or j == 0 or j == N-1:
+    cellN = min(h, w) / float(N)
+    band_width = 1.75 * cellN
+    band_step  = 0.75 * cellN
+    max_depth  = max_depth_cells * cellN
+
+    if min_L is None:
+        min_L = int(0.65 * N)
+    if min_TP is None:
+        min_TP = int(0.35 * N)
+
+    sides = ("top", "right", "bottom", "left")
+    adj_pairs = [("top", "left"), ("top", "right"),
+                 ("bottom", "left"), ("bottom", "right")]
+
+    depth  = {s: 0.0 for s in sides}
+    locked = {s: None for s in sides}
+    counts = {s: 0 for s in sides}
+
+    best = {
+        s: {
+            "vxy": None,
+            "abc": None,
+            "cnt": 0,
+            "depth": None
+        }
+        for s in sides
+    }
+
+    phase = "L"
+    L_pair = None
+
+    def fit_line_vxy(pts):
+        vx, vy, x0, y0 = cv2.fitLine(
+            pts.astype(np.float32),
+            cv2.DIST_L2, 0, 0.01, 0.01
+        )
+        # make scalars (avoids future numpy warnings)
+        return float(vx.ravel()[0]), float(vy.ravel()[0]), float(x0.ravel()[0]), float(y0.ravel()[0])
+
+    def count_support(Labc, pts_xy, sig, core_frac=0.6):
+        a, b, c = Labc
+        denom = np.sqrt(a*a + b*b) + 1e-9
+        dist = np.abs(a*pts_xy[:, 0] + b*pts_xy[:, 1] + c) / denom
+
+        radius = np.sqrt(2.0) * sig
+        radius = np.clip(radius, 0.25*cellN, 0.9*cellN)
+        core = core_frac * radius
+
+        return int(np.sum(dist <= core))
+
+    for it in range(max_iters):
+
+        # ----- UPDATE BEST CANDIDATES (monotonic) -----
+        if phase == "L":
+            search_sides = sides
+        else:
+            # keep searching only the non-L sides
+            search_sides = [s for s in sides if (L_pair is None or s not in L_pair)]
+
+        for s in search_sides:
+            if locked[s] is not None or depth[s] > max_depth:
                 continue
 
-            cx = (j + 0.5) * cell_x
-            cy = (i + 0.5) * cell_y
+            pts_fit, pts_all, sig_all = band_points_with_indices(
+                blobs_xy, blobs_sigma,
+                s, depth[s], band_width, h, w
+            )
 
-            if len(pts):
-                d = np.linalg.norm(pts - np.array([cx, cy]), axis=1)
-                if np.min(d) < 0.45 * min(cell_x, cell_y):
-                    grid[i, j] = 1
+            if pts_fit is not None and len(pts_fit) >= 2:
+                Lvxy = fit_line_vxy(pts_fit)
+                Labc = line_vxy_to_abc(Lvxy)
+                cnt = count_support(Labc, pts_all, sig_all)
 
-    return grid
+                # keep ONLY if better than previous best
+                if cnt > best[s]["cnt"]:
+                    best[s] = {
+                        "vxy": Lvxy,
+                        "abc": Labc,
+                        "cnt": cnt,
+                        "depth": depth[s]
+                    }
 
-def draw_parallelogram_grid(vis: np.ndarray, inter: np.ndarray, color=(0, 0, 255), thickness=1):
-    """Draw cell boundaries from intersections."""
-    Np1 = inter.shape[0]
-    # horizontal segments
-    for i in range(Np1):
-        for j in range(Np1 - 1):
-            p1 = inter[i, j]
-            p2 = inter[i, j + 1]
-            cv2.line(vis, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), color, thickness)
-    # vertical segments
-    for j in range(Np1):
-        for i in range(Np1 - 1):
-            p1 = inter[i, j]
-            p2 = inter[i + 1, j]
-            cv2.line(vis, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), color, thickness)
+            depth[s] += band_step
+
+        # ----- PHASE 1: LOCK L USING BEST (not last_try) -----
+        if phase == "L":
+            best_pair = None
+            for s0, s1 in adj_pairs:
+                if best[s0]["abc"] is None or best[s1]["abc"] is None:
+                    continue
+                score = best[s0]["cnt"] + best[s1]["cnt"]
+                if best_pair is None or score > best_pair[0]:
+                    best_pair = (score, s0, s1)
+
+            if best_pair is not None:
+                _, s0, s1 = best_pair
+                if best[s0]["cnt"] >= min_L and best[s1]["cnt"] >= min_L:
+                    L_pair = (s0, s1)
+
+                    for s in L_pair:
+                        locked[s] = best[s]          # store dict with abc/cnt/depth
+                        counts[s] = best[s]["cnt"]
+
+                    phase = "TP"
+
+        # ----- PHASE 2: LOCK TP USING BEST (no reset) -----
+        if phase == "TP" and L_pair is not None:
+            for s in sides:
+                if s in L_pair or locked[s] is not None:
+                    continue
+                if best[s]["abc"] is not None and best[s]["cnt"] >= min_TP:
+                    locked[s] = best[s]
+                    counts[s] = best[s]["cnt"]
+
+            
+
+        # ----- DEBUG -----
+        if dbg_dir is not None and stem is not None:
+            vis = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
+
+            COL_BEST = (255, 0, 255)   # magenta (best candidate)
+            COL_L    = (0, 255, 255)   # yellow (locked L)
+            COL_TP   = (255, 255, 0)   # cyan (locked TP)
+
+            # draw best candidate lines (magenta)
+            for s in sides:
+                if best[s]["abc"] is not None:
+                    draw_infinite_line(vis, best[s]["abc"], COL_BEST, 1)
+
+            # draw locked lines (L yellow, TP cyan)
+            for s in sides:
+                if locked[s] is None:
+                    continue
+                if L_pair is not None and s in L_pair:
+                    draw_infinite_line(vis, locked[s]["abc"], COL_L, 2)
+                else:
+                    draw_infinite_line(vis, locked[s]["abc"], COL_TP, 2)
+
+            draw_blobs(vis, blobs, (255, 0, 0), 1)
+
+            txt = [
+                f"FALLBACK N={N} it={it} phase={phase} L_pair={L_pair}",
+                "best_cnts: " + " ".join(f"{s}={best[s]['cnt']}" for s in sides),
+                "depths: " + " ".join(f"{s}={depth[s]:.1f}" for s in sides),
+                f"min_L={min_L} min_TP={min_TP} bw={band_width:.1f} step={band_step:.1f}"
+            ]
+            put_debug_text(vis, txt, (10, 18))
+            cv2.imwrite(str(dbg_dir / f"{stem}_N{N}_iter{it:02d}.png"), vis)
+
+        if all(locked[s] is not None for s in sides):
+            return {
+                "locked": locked,
+                "counts": counts,
+                "L_pair": L_pair,
+                "cellN": cellN
+            }
+
+    return None
 
 
-# ============================================================
-# Output
-# ============================================================
+def band_points_with_indices(blobs_xy, blobs_sigma, side, depth, band_width, h, w):
+    """
+    Returns:
+      pts_fit   : (K,2) outermost points for line fitting
+      pts_all   : (M,2) all band points for support counting
+      sig_all   : (M,) sigmas for pts_all
+    """
 
-def grid_to_image(grid: np.ndarray, scale: int = 12) -> np.ndarray:
-    # grid: 1=black module, 0=white module
-    # image: 0=black, 255=white
-    small = (1 - grid.astype(np.uint8)) * 255
-    N = small.shape[0]
-    return cv2.resize(small, (N * scale, N * scale), interpolation=cv2.INTER_NEAREST)
+    if side == "top":
+        mask = blobs_xy[:, 1] < depth + band_width
+    elif side == "bottom":
+        mask = blobs_xy[:, 1] > h - (depth + band_width)
+    elif side == "left":
+        mask = blobs_xy[:, 0] < depth + band_width
+    elif side == "right":
+        mask = blobs_xy[:, 0] > w - (depth + band_width)
+    else:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros((0,))
+
+    pts_all = blobs_xy[mask]
+    sig_all = blobs_sigma[mask]
+
+    if len(pts_all) < 2:
+        return np.zeros((0, 2)), pts_all, sig_all
+
+    # keep outermost ~50% for fitting
+    k = max(3, int(0.5 * len(pts_all)))
+
+    if side == "top":
+        idx = np.argsort(pts_all[:, 1])[:k]
+    elif side == "bottom":
+        idx = np.argsort(pts_all[:, 1])[-k:]
+    elif side == "left":
+        idx = np.argsort(pts_all[:, 0])[:k]
+    else:  # right
+        idx = np.argsort(pts_all[:, 0])[-k:]
+
+    pts_fit = pts_all[idx]
+    return pts_fit, pts_all, sig_all
+
+def offset_lines_for_crop(lines_abc, N, img_shape, pitch=None):
+    """
+    Offset borders to define a crop quad.
+
+    FINAL RULE:
+    - ALWAYS expand outward by 0.5 * cell_size
+    - NEVER offset inward
+    - If expansion exceeds image, CLIP quad corners to image bounds
+    """
+
+    h, w = img_shape
+    sides = ("top", "right", "bottom", "left")
+
+    # normalize lines (ax + by + c = 0 with ||(a,b)|| = 1)
+    norm = {}
+    for s in sides:
+        a, b, c = lines_abc[s]
+        d = np.sqrt(a*a + b*b) + 1e-9
+        norm[s] = (a/d, b/d, c/d)
+
+    # estimate cell size
+    if pitch is not None and np.isfinite(pitch):
+        cell_size = float(pitch)
+    else:
+        # fallback: estimate from opposite borders
+        def line_dist(L1, L2):
+            return abs(L1[2] - L2[2])
+
+        cell_y = line_dist(norm["top"], norm["bottom"]) / (N - 1)
+        cell_x = line_dist(norm["left"], norm["right"]) / (N - 1)
+        cell_size = 0.5 * (cell_x + cell_y)
+
+    delta = 0.5 * cell_size  # ALWAYS outward
+
+    center = np.array([w * 0.5, h * 0.5], dtype=np.float32)
+
+    # offset lines outward
+    offset = {}
+    for s in sides:
+        a, b, c = norm[s]
+        sign = compute_outward_sign((a, b, c), center)
+        offset[s] = (a, b, c + sign * delta)
+
+    # compute quad from offset lines
+    quad = quad_from_abc_lines(offset)
+    if quad is None:
+        return None
+
+    # CLIP quad corners to image bounds (NO inward padding)
+    quad_clipped = []
+    for (x, y) in quad:
+        x = min(max(float(x), 0.0), w - 1.0)
+        y = min(max(float(y), 0.0), h - 1.0)
+        quad_clipped.append((x, y))
+
+    return np.array(quad_clipped, dtype=np.float32)
+
+def compute_outward_sign(Ln, center_xy):
+    """
+    For each border line, decide which normal direction points outward (away from center).
+    If center is on positive side (ax+by+c > 0), then outward is +normal, else outward is -normal.
+    """
+    a, b, c = Ln
+    val = a * center_xy[0] + b * center_xy[1] + c
+    return 1.0 if val > 0 else -1.0
 
 
-# ============================================================
-# Laser
-# ============================================================
+def build_quad_from_lines(locked_lines):
+    TL = intersect_lines(locked_lines["top"], locked_lines["left"])
+    TR = intersect_lines(locked_lines["top"], locked_lines["right"])
+    BR = intersect_lines(locked_lines["bottom"], locked_lines["right"])
+    BL = intersect_lines(locked_lines["bottom"], locked_lines["left"])
+    if any(p is None for p in (TL, TR, BR, BL)):
+        return None
+    return np.array([TL, TR, BR, BL], dtype=np.float32)
 
-def process_laser(gray: np.ndarray) -> np.ndarray:
-    if gray.dtype != np.uint8:
-        gray = np.clip(gray, 0, 255).astype(np.uint8)
-    blur = cv2.medianBlur(gray, 3)
-    thr = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,
-        25, 5
-    )
-    return thr
 
+def order_quad_TLTRBRBL(quad):
+    """
+    Robust corner ordering for quad points.
+    """
+    q = np.asarray(quad, dtype=np.float32)
+    if q.shape != (4, 2):
+        return None
+    s = q[:, 0] + q[:, 1]
+    d = q[:, 0] - q[:, 1]
+    tl = q[np.argmin(s)]
+    br = q[np.argmax(s)]
+    tr = q[np.argmax(d)]
+    bl = q[np.argmin(d)]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+def warp_to_square(gray, quad, out_size=240):
+    quad = order_quad_TLTRBRBL(quad)
+    if quad is None:
+        return None, None
+    dst = np.array([[0, 0], [out_size - 1, 0], [out_size - 1, out_size - 1], [0, out_size - 1]], dtype=np.float32)
+    H = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    warped = cv2.warpPerspective(gray, H, (out_size, out_size), flags=cv2.INTER_LINEAR)
+    return warped, H
+
+def debug_pca_grid_estimation(blobs, gray, pitch, out_path):
+    pts = np.stack([blobs[:, 1], blobs[:, 0]], axis=1).astype(np.float32)
+
+    mean = pts.mean(axis=0, keepdims=True)
+    X = pts - mean
+
+    # PCA
+    _, _, Vt = np.linalg.svd(X, full_matrices=False)
+    V = Vt.T
+    uv = X @ V
+
+    # Spans
+    umin, umax = uv[:, 0].min(), uv[:, 0].max()
+    vmin, vmax = uv[:, 1].min(), uv[:, 1].max()
+
+    # ---- VIS ----
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+
+    # (1) spatial
+    ax[0].imshow(gray, cmap="gray")
+    ax[0].scatter(pts[:, 0], pts[:, 1], s=8, c="cyan")
+
+    # PCA axes
+    for i, col in enumerate(["red", "yellow"]):
+        d = V[:, i] * pitch * 6
+        ax[0].plot(
+            [mean[0,0]-d[0], mean[0,0]+d[0]],
+            [mean[0,1]-d[1], mean[0,1]+d[1]],
+            color=col, linewidth=2
+        )
+
+    ax[0].set_title("Blobs + PCA axes")
+
+    # (2) projection histograms
+    ax[1].hist(uv[:, 0], bins=40, alpha=0.6, label="PC1")
+    ax[1].hist(uv[:, 1], bins=40, alpha=0.6, label="PC2")
+
+    for k in range(-10, 11):
+        ax[1].axvline(k * pitch, color="k", alpha=0.05)
+
+    ax[1].axvline(umin, color="red")
+    ax[1].axvline(umax, color="red")
+    ax[1].axvline(vmin, color="yellow")
+    ax[1].axvline(vmax, color="yellow")
+
+    ax[1].legend()
+    ax[1].set_title("PCA projections (missing edge bins)")
+
+    plt.tight_layout()
+    plt.savefig(str(out_path))
+    plt.close()
 
 # ============================================================
 # Main
@@ -627,11 +1033,19 @@ def process_laser(gray: np.ndarray) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--imgs", required=True, help="Folder with rectified crops")
-    ap.add_argument("--labels", required=True, help="Folder with label txts")
-    ap.add_argument("--out", required=True, help="Output folder")
+    ap.add_argument("--imgs", required=True)
+    ap.add_argument("--labels", required=True)
+    ap.add_argument("--out", required=True)
     ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--log_threshold", type=float, default=0.01, help="blob_log threshold (lower = more blobs)")
+
+    ap.add_argument("--log_threshold", type=float, default=0.038)
+    ap.add_argument("--max_iters", type=int, default=5)
+    ap.add_argument("--max_depth_cells", type=float, default=2)
+
+    ap.add_argument("--warp_size", type=int, default=240)
+    ap.add_argument("--scale", type=int, default=12)
+    ap.add_argument("--quiet", type=int, default=2)
+
     args = ap.parse_args()
 
     img_dir = Path(args.imgs)
@@ -653,123 +1067,225 @@ def main():
         img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         if img is None:
             continue
-
+        
         gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         if gray0.dtype != np.uint8:
             gray0 = np.clip(gray0, 0, 255).astype(np.uint8)
-        h, w = gray0.shape
 
         label_path = find_label_for_image(img_path, lab_dir)
         top = read_top_label(label_path)
         if top is None:
             continue
+
         cls_id, conf = top
         mode = "dotpeen" if cls_id == 0 else "laser" if cls_id == 1 else "unknown"
         print(f"[INFO] {img_path.name}: {mode} (conf={conf:.3f})")
 
+        # -------------------------
+        # LASER
+        # -------------------------
         if mode == "laser":
-            thr = process_laser(gray0)
-            cv2.imwrite(str(out_dir / f"{img_path.stem}_laser.png"), thr)
+            laser_img = process_laser(gray0)
+            cv2.imwrite(str(out_dir / f"{img_path.stem}_laser.png"), laser_img)
+
             if args.debug:
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser_debug.png"), thr)
+                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_laser_debug.png"), laser_img)
+
             continue
 
         if mode != "dotpeen":
             continue
 
-        # STEP 0
+        solved = False
+
+        # -------------------------
+        # DOTPEEN: polarity fix
+        # -------------------------
         gray_pol, hists = quadrant_polarity_fix(gray0)
         if args.debug:
             save_hist_panel(hists, dbg_dir / f"{img_path.stem}_step0_hists.png")
             cv2.imwrite(str(dbg_dir / f"{img_path.stem}_step0_polarity.png"), gray_pol)
 
-        # STEP 1: blobs (on polarity image)
-        blobs, gray_used, cell_virtual = detect_dots_log(
-            gray_pol, grid_size_virtual=15, threshold=args.log_threshold
-        )
-        if len(blobs) == 0:
-            print(f"[WARN] no blobs: {img_path.name}")
+        # -------------------------
+        # blobs on original crop
+        # -------------------------
+        blobs, gray_used, _ = detect_dots_log(gray_pol, grid_size_virtual=16, threshold=args.log_threshold)
+        if len(blobs) < 10:
+            print(f"[WARN] too few blobs: {len(blobs)} -> skip {img_path.name}")
             continue
 
-        # Run both N=14 and N=16
-        for N in (14, 16):
-            # Debug step1: raw blobs blue + red cell boundaries
-            if args.debug:
-                vis1 = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
-                draw_cell_grid(vis1, N, color=(0, 0, 255), thickness=1)     # red
-                draw_blobs(vis1, blobs, color_bgr=(255, 0, 0), thickness=2) # blue
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_step1_raw_grid_blobs.png"), vis1)
+        if args.debug:
+            vis = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
+            draw_blobs(vis, blobs, (255, 0, 0), 2)
+            cv2.imwrite(str(dbg_dir / f"{img_path.stem}_dp_step2_blobs.png"), vis)
 
-            # STEP 2: filter blobs per cell
-            blobs_f = filter_blobs_in_cells(blobs, gray_pol, N)
+        h, w = gray_used.shape
+        blobs_xy = np.stack([blobs[:, 1], blobs[:, 0]], axis=1).astype(np.float32)  # (x,y)
 
-            if args.debug:
-                vis2 = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
-                draw_cell_grid(vis2, N, color=(0, 0, 255), thickness=1)      # red
-                draw_blobs(vis2, blobs_f, color_bgr=(0, 255, 0), thickness=2) # green
-                cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_step2_filtered_grid_blobs.png"), vis2)
+        # -------------------------
+        # Decide N
+        # -------------------------
+        # You said you added this helper:
+        N, pitch = estimate_N_and_pitch(blobs)
+        if N is None:
+            print(f"[FAIL] could not estimate N for {img_path.name}")
+            continue
 
-            grid_f = grid_from_blobs_rect(blobs_f, N, h, w)
+        if pitch is None or not np.isfinite(pitch) or pitch < 1.0:
+            pitch = min(h, w) / float(N)
+        
+        if args.debug:
+            debug_pca_grid_estimation(
+                blobs,
+                gray_used,
+                pitch,
+                dbg_dir / f"{img_path.stem}_pca_grid_debug.png"
+            )
 
-            # STEP 3: choose L on filtered grid (before forcing)
-            L_pair = choose_L_sides_strict(grid_f)
+        solved = False
 
-            # corner validation: allow ONLY timing-timing corner to be empty
-            timing_corner = timing_corner_for_Lpair(L_pair)
+        # -------------------------
+        # FAST PATH: NxN grid over full image
+        # -------------------------
+        grid0 = fast_grid_fit_whole_image(blobs_xy, (h, w), N)
+        hyp = score_grid_borders(grid0)
 
-            corners = {
-                "TL": (0, 0),
-                "TR": (0, N - 1),
-                "BL": (N - 1, 0),
-                "BR": (N - 1, N - 1),
-            }
-            # allowed empty corner:
-            if timing_corner == (0, 0):
-                allowed = "TL"
-            elif timing_corner == (0, -1):
-                allowed = "TR"
-            elif timing_corner == (-1, 0):
-                allowed = "BL"
-            else:
-                allowed = "BR"
+        if args.debug:
+            vis_fast = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
+            draw_grid_on_image(vis_fast, N, (0, 0, 255), 1)
+            draw_blobs(vis_fast, blobs, (255, 0, 0), 2)
+            lines = [
+                f"FAST N={N} rot={hyp['rot']} score={hyp['score']:.2f} pass={hyp['pass_fast']}",
+                f"counts: top={hyp['counts']['top']} right={hyp['counts']['right']} bottom={hyp['counts']['bottom']} left={hyp['counts']['left']}",
+                f"L_pair={hyp['L_pair']}"
+            ]
+            put_debug_text(vis_fast, lines, (10, 18))
+            cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_dp_step3_grid_fast.png"), vis_fast)
 
-            bad = False
-            for name, (i, j) in corners.items():
-                if name == allowed:
-                    continue
-                if grid_f[i, j] == 0:
-                    bad = True
-                    break
+        if hyp["pass_fast"]:
+            grid_best = hyp["grid"]
+            L_pair = hyp["L_pair"]
 
-            # STEP 4: recalibrate grid if corner test fails
-            inter = None
-            if bad:  # corner validation failed
-                grid_f = regrid_from_predicted_L(blobs_f, (h, w), N, L_pair)
+            grid_final = enforce_L_and_timing_by_sides(
+                grid_best,
+                L_pair=L_pair,
+                timing_corner_value=0
+            )
+            grid_out = pad_modules(grid_final, pad=args.quiet)
+            syn = grid_to_image(grid_out, scale=args.scale)
+            cv2.imwrite(str(out_dir / f"{img_path.stem}_N{N}_synthetic.png"), syn)
+            solved = True
+
+        # -------------------------
+        # FALLBACK
+        # -------------------------
+        if not solved:
+            fallback_ok = True
+
+            border = try_find_border_iterative_locked(
+                blobs=blobs,
+                gray_used=gray_used,
+                N=N,
+                dbg_dir=(dbg_dir if args.debug else None),
+                stem=img_path.stem,
+                max_iters=args.max_iters,
+                max_depth_cells=args.max_depth_cells
+            )
+            if border is None:
+                print(f"[FAIL] fallback failed for N={N}: {img_path.name}")
+                fallback_ok = False
+
+            if fallback_ok:
+                locked = border["locked"]
+
+                if any(locked[s] is None for s in ("top", "right", "bottom", "left")):
+                    print(f"[FAIL] fallback incomplete (missing sides) for {img_path.name}")
+                    fallback_ok = False
+
+            if fallback_ok:
+                quad = offset_lines_for_crop(
+                    lines_abc={s: locked[s]["abc"] for s in ("top","right","bottom","left")},
+                    N=N,
+                    img_shape=gray_used.shape,
+                    pitch=pitch
+                )
+                if quad is None:
+                    fallback_ok = False
+
+            if fallback_ok:
+                # crop safely
+                pad = int(0.25 * min(gray_pol.shape))
+                crop, quad_shift, _ = crop_by_quad(gray_pol, quad, pad=pad)
+
+                corners = order_corners(quad_shift)
+                warped = warp_to_square_nearest(crop, corners, out_size=args.warp_size)
 
                 if args.debug:
-                    vis3 = cv2.cvtColor(gray_used, cv2.COLOR_GRAY2BGR)
-
-                    # draw the (new) grid cell boundaries in red
-                    draw_cell_grid(vis3, N, color=(0, 255, 255), thickness=1)
-
-                    # draw blobs in green
-                    draw_blobs(vis3, blobs_f, color_bgr=(0, 255, 0), thickness=2)
-
                     cv2.imwrite(
-                        str(dbg_dir / f"{img_path.stem}_N{N}_step3_regrid.png"),
-                        vis3
+                        str(dbg_dir / f"{img_path.stem}_N{N}_fallback_warped.png"),
+                        warped
                     )
 
+                # Re-run blobs on warped
+                blobs_w, gray_w, _ = detect_dots_log(warped, grid_size_virtual=N, threshold=args.log_threshold)
+                if len(blobs_w) < 10:
+                    print(f"[FAIL] too few blobs on warped for {img_path.name}")
+                    fallback_ok = False
 
-            # STEP 5: enforce border strictly
-            grid_final = enforce_L_and_timing_by_sides(grid_f, L_pair)
+            if fallback_ok:
+                blobs_xy_w = np.stack([blobs_w[:, 1], blobs_w[:, 0]], axis=1).astype(np.float32)
+                hw, ww = gray_w.shape
 
-            # STEP 6: synthetic
-            syn = grid_to_image(grid_final, scale=12)
-            cv2.imwrite(str(out_dir / f"{img_path.stem}_N{N}_synthetic.png"), syn)
+                # FAST grid on warped using SAME N (no re-estimation!)
+                grid_w0 = fast_grid_fit_whole_image(blobs_xy_w, (hw, ww), N)
+                hyp_w = score_grid_borders(grid_w0)
+
+                if args.debug:
+                    vis_w = cv2.cvtColor(gray_w, cv2.COLOR_GRAY2BGR)
+                    draw_grid_on_image(vis_w, N, (0, 0, 255), 1)
+                    draw_blobs(vis_w, blobs_w, (255, 0, 0), 2)
+                    lines = [
+                        f"WARP-FAST N={N} rot={hyp_w['rot']} score={hyp_w['score']:.2f} pass={hyp_w['pass_fast']}",
+                        f"counts: top={hyp_w['counts']['top']} right={hyp_w['counts']['right']} bottom={hyp_w['counts']['bottom']} left={hyp_w['counts']['left']}",
+                        f"L_pair={hyp_w['L_pair']}"
+                    ]
+                    put_debug_text(vis_w, lines, (10, 18))
+                    cv2.imwrite(str(dbg_dir / f"{img_path.stem}_N{N}_fallback_grid.png"), vis_w)
+
+                if hyp_w["pass_fast"]:
+                    grid_best = hyp_w["grid"]
+                    L_pair = border["L_pair"]
+
+                    grid_final = enforce_L_and_timing_by_sides(
+                        grid_w0,
+                        L_pair=L_pair,
+                        timing_corner_value=0
+                    )
+                    grid_out = pad_modules(grid_final, pad=args.quiet)
+                    syn = grid_to_image(grid_out, scale=args.scale)
+                    cv2.imwrite(str(out_dir / f"{img_path.stem}_N{N}_synthetic.png"), syn)
+                    solved = True
+                else:
+                    print(f"[FAIL] warp-fast still failed for {img_path.name}")
+
+            if not solved:
+                print(f"[FAIL] dotpeen failed → exporting laser fallback: {img_path.name}")
+
+                # --- LASER FALLBACK ---
+                laserf_img = process_laser(gray0)
+
+                cv2.imwrite(
+                    str(out_dir / f"{img_path.stem}_fallback_laser.png"),
+                    laserf_img
+                )
+
+                if args.debug:
+                    cv2.imwrite(
+                        str(dbg_dir / f"{img_path.stem}_fallback_laser_debug.png"),
+                        laserf_img
+                    )
 
     print("[OK] Done.")
-
 
 if __name__ == "__main__":
     main()

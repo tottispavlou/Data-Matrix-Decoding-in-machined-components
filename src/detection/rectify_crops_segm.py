@@ -196,15 +196,32 @@ def main():
         cv2.fillPoly(mask, [pts_px.astype(np.int32)], 255)
 
         # ----------------------
-        # STEP 2: MORPH CLOSING
+        # STEP 2: MORPH CLEAN + BRIDGE BREAK
         # ----------------------
-        kernel = np.ones((3, 3), np.uint8)
-        mask_close = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # Break thin "tails"/bridges that connect junk to the main region
+        k_open = np.ones((3, 3), np.uint8)
+        mask_break = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1) # 1 teration because the bridge is 1 bit usually
+
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(mask_break, connectivity=8)
+
+        if n <= 1:
+            continue  # no foreground
+
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep = 1 + np.argmax(areas)
+
+        mask_main = np.zeros_like(mask_break)
+        mask_main[lab == keep] = 255
+
+        # Restore any tiny gaps introduced by opening
+        k_close = np.ones((3, 3), np.uint8)
+        mask_main = cv2.morphologyEx(mask_main, cv2.MORPH_CLOSE, k_close, iterations=1)
 
         # ----------------------
-        # STEP 3: CONTOUR
+        # STEP 3: CONTOUR 
         # ----------------------
-        cnts, _ = cv2.findContours(mask_close, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(mask_main, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
             continue
         cnt = max(cnts, key=cv2.contourArea)
@@ -221,7 +238,7 @@ def main():
                 "image_area_px2": image_area,
                 "code_area_px2": code_area,
                 "code_ratio": reso_metric,
-                "confidence": conf,
+                "class": cls,
                 "num_contour_pts": len(cnt),
             })
 
@@ -250,14 +267,14 @@ def main():
         corners = order_corners(pts4)
 
         if cls == 0:
-            corners = expand_quad(corners, img.shape, pad_frac=0.02)
+            corners = expand_quad(corners, img.shape, pad_frac=0.03)
         if cls == 1:
             corners = expand_quad(corners, img.shape, pad_frac=0.1)
 
         # ----------------------
         # STEP 8: WARP
         # ----------------------
-        crop = warp_to_square(img, corners, out_size=200)
+        crop = warp_to_square(img, corners, out_size=240)
         cv2.imwrite(str(out_dir / f"{img_path.stem}_rectified.png"), crop)
         saved += 1
 
@@ -276,9 +293,9 @@ def main():
             dbg1 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             dbg1 = label(dbg1, "1: Raw Mask")
 
-            # panel 2: closed mask
-            dbg2 = cv2.cvtColor(mask_close, cv2.COLOR_GRAY2BGR)
-            dbg2 = label(dbg2, "2: Morph Closing")
+            # panel 2: closed main mask
+            dbg2 = cv2.cvtColor(mask_main, cv2.COLOR_GRAY2BGR)
+            dbg2 = label(dbg2, "2: Morph Mask Cleaning")
 
             # panel 3: contour overlay
             dbg3 = img.copy()
