@@ -17,7 +17,7 @@ PREPROC_SCRIPT = Path("src/preproc/preprocess_gaussian.py")
 RECTIFY_SCRIPT = Path("src/detection/rectify_crops_segm.py")
 GRID_SCRIPT = Path("src/grid_fitting/grid_fitting.py")
 
-PIPELINE_ROOT = Path("checking")
+PIPELINE_ROOT = Path("pipeline_results")
 PIPELINE_ROOT.mkdir(exist_ok=True)
 
 
@@ -206,7 +206,7 @@ def run_pipeline(image_path: str, save_txt=True):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python src/run_pipeline.py data/raw/never_used_pics/")
+        print("Usage: python src/run_pipeline.py data/raw/final_testing_dataset/")
         sys.exit(1)
 
     run_pipeline(sys.argv[1])

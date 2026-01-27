@@ -6,7 +6,7 @@ import traceback
 from run_pipeline import run_pipeline
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-PIPELINE_ROOT = Path("checking")
+PIPELINE_ROOT = Path("pipeline_results")
 PIPELINE_ROOT.mkdir(exist_ok=True)
 
 def run_batch(
