@@ -203,7 +203,7 @@ def main():
         k_open = np.ones((3, 3), np.uint8)
         mask_break = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1) # 1 teration because the bridge is 1 bit usually
 
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(mask_break, connectivity=8)
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(mask_break, connectivity=8) # 8-way connectivity means UDLR & diagonial to those
 
         if n <= 1:
             continue  # no foreground

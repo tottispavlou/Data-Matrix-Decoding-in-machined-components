@@ -567,7 +567,7 @@ def try_find_border_iterative_locked(
 
             depth[s] += band_step
 
-        # ----- PHASE 1: LOCK L USING BEST (not last_try) -----
+        # ----- PHASE 1: LOCK L USING BEST -----
         if phase == "L":
             best_pair = None
             for s0, s1 in adj_pairs:
